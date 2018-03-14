@@ -7,15 +7,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmd/internal/browser"
 	"fmt"
 	"html/template"
 	"io"
 	"io/ioutil"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 )
 
 // htmlOutput reads the profile data from profile and generates an HTML
@@ -65,16 +64,19 @@ func htmlOutput(profile, outfile string) error {
 	} else {
 		out, err = os.Create(outfile)
 	}
+	if err != nil {
+		return err
+	}
 	err = htmlTemplate.Execute(out, d)
-	if err == nil {
-		err = out.Close()
+	if err2 := out.Close(); err == nil {
+		err = err2
 	}
 	if err != nil {
 		return err
 	}
 
 	if outfile == "" {
-		if !startBrowser("file://" + out.Name()) {
+		if !browser.Open("file://" + out.Name()) {
 			fmt.Fprintf(os.Stderr, "HTML output written to %s\n", out.Name())
 		}
 	}
@@ -131,23 +133,6 @@ func htmlGen(w io.Writer, src []byte, boundaries []Boundary) error {
 		}
 	}
 	return dst.Flush()
-}
-
-// startBrowser tries to open the URL in a browser
-// and reports whether it succeeds.
-func startBrowser(url string) bool {
-	// try to start the browser
-	var args []string
-	switch runtime.GOOS {
-	case "darwin":
-		args = []string{"open"}
-	case "windows":
-		args = []string{"cmd", "/c", "start"}
-	default:
-		args = []string{"xdg-open"}
-	}
-	cmd := exec.Command(args[0], append(args[1:], url)...)
-	return cmd.Start() == nil
 }
 
 // rgb returns an rgb value for the specified coverage value
@@ -258,20 +243,34 @@ const tmplHTML = `
 		</div>
 		<div id="content">
 		{{range $i, $f := .Files}}
-		<pre class="file" id="file{{$i}}" {{if $i}}style="display: none"{{end}}>{{$f.Body}}</pre>
+		<pre class="file" id="file{{$i}}" style="display: none">{{$f.Body}}</pre>
 		{{end}}
 		</div>
 	</body>
 	<script>
 	(function() {
 		var files = document.getElementById('files');
-		var visible = document.getElementById('file0');
+		var visible;
 		files.addEventListener('change', onChange, false);
-		function onChange() {
-			visible.style.display = 'none';
-			visible = document.getElementById(files.value);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
 			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
 			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
 		}
 	})();
 	</script>

@@ -48,7 +48,7 @@ const (
 )
 
 const (
-	sof0Marker = 0xc0 // Start Of Frame (Baseline).
+	sof0Marker = 0xc0 // Start Of Frame (Baseline Sequential).
 	sof1Marker = 0xc1 // Start Of Frame (Extended Sequential).
 	sof2Marker = 0xc2 // Start Of Frame (Progressive).
 	dhtMarker  = 0xc4 // Define Huffman Table.
@@ -89,7 +89,7 @@ var unzig = [blockSize]int{
 	53, 60, 61, 54, 47, 55, 62, 63,
 }
 
-// Reader is deprecated.
+// Deprecated: Reader is deprecated.
 type Reader interface {
 	io.ByteReader
 	io.Reader
@@ -126,9 +126,17 @@ type decoder struct {
 	blackPix    []byte
 	blackStride int
 
-	ri                  int // Restart Interval.
-	nComp               int
-	progressive         bool
+	ri    int // Restart Interval.
+	nComp int
+
+	// As per section 4.5, there are four modes of operation (selected by the
+	// SOF? markers): sequential DCT, progressive DCT, lossless and
+	// hierarchical, although this implementation does not support the latter
+	// two non-DCT modes. Sequential DCT is further split into baseline and
+	// extended, as per section 4.11.
+	baseline    bool
+	progressive bool
+
 	jfif                bool
 	adobeTransformValid bool
 	adobeTransform      uint8
@@ -169,9 +177,6 @@ func (d *decoder) fill() error {
 // sometimes overshoot and read one or two too many bytes. Two-byte overshoot
 // can happen when expecting to read a 0xff 0x00 byte-stuffed byte.
 func (d *decoder) unreadByteStuffedByte() {
-	if d.bytes.nUnreadable == 0 {
-		return
-	}
 	d.bytes.i -= d.bytes.nUnreadable
 	d.bytes.nUnreadable = 0
 	if d.bits.n >= 8 {
@@ -243,7 +248,12 @@ func (d *decoder) readByteStuffedByte() (x byte, err error) {
 // stuffing.
 func (d *decoder) readFull(p []byte) error {
 	// Unread the overshot bytes, if any.
-	d.unreadByteStuffedByte()
+	if d.bytes.nUnreadable != 0 {
+		if d.bits.n >= 8 {
+			d.unreadByteStuffedByte()
+		}
+		d.bytes.nUnreadable = 0
+	}
 
 	for {
 		n := copy(p, d.bytes.buf[d.bytes.i:d.bytes.j])
@@ -265,7 +275,12 @@ func (d *decoder) readFull(p []byte) error {
 // ignore ignores the next n bytes.
 func (d *decoder) ignore(n int) error {
 	// Unread the overshot bytes, if any.
-	d.unreadByteStuffedByte()
+	if d.bytes.nUnreadable != 0 {
+		if d.bits.n >= 8 {
+			d.unreadByteStuffedByte()
+		}
+		d.bytes.nUnreadable = 0
+	}
 
 	for {
 		m := d.bytes.j - d.bytes.i
@@ -589,6 +604,7 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 
 		switch marker {
 		case sof0Marker, sof1Marker, sof2Marker:
+			d.baseline = marker == sof0Marker
 			d.progressive = marker == sof2Marker
 			err = d.processSOF(n)
 			if configOnly && d.jfif {
@@ -631,6 +647,12 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 			}
 		}
 		if err != nil {
+			return nil, err
+		}
+	}
+
+	if d.progressive {
+		if err := d.reconstructProgressiveImage(); err != nil {
 			return nil, err
 		}
 	}

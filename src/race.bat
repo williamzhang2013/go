@@ -3,7 +3,7 @@
 :: license that can be found in the LICENSE file.
 
 :: race.bash tests the standard library under the race detector.
-:: http://golang.org/doc/articles/race_detector.html
+:: https://golang.org/doc/articles/race_detector.html
 
 @echo off
 
@@ -34,7 +34,7 @@ echo # go install -race std
 go install -race std
 if errorlevel 1 goto fail
 
-go tool dist test -no-rebuild -race
+go tool dist test -race
 
 if errorlevel 1 goto fail
 goto succ

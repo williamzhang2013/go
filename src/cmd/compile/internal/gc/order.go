@@ -1,19 +1,20 @@
-// Copyright 2012 The Go Authors.  All rights reserved.
+// Copyright 2012 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package gc
 
 import (
+	"cmd/compile/internal/types"
+	"cmd/internal/src"
 	"fmt"
-	"strings"
 )
 
 // Rewrite tree to use separate statements to enforce
-// order of evaluation.  Makes walk easier, because it
+// order of evaluation. Makes walk easier, because it
 // can (after this runs) reorder at will within an expression.
 //
-// Rewrite x op= y into x = x op y.
+// Rewrite m[k] op= r into m[k] = m[k] op r if op is / or %.
 //
 // Introduce temporaries as needed by runtime routines.
 // For example, the map runtime routines take the map key
@@ -41,12 +42,11 @@ import (
 
 // Order holds state during the ordering process.
 type Order struct {
-	out  *NodeList // list of generated statements
-	temp *NodeList // head of stack of temporary variables
-	free *NodeList // free list of NodeList* structs (for use in temp)
+	out  []*Node // list of generated statements
+	temp []*Node // stack of temporary variables
 }
 
-// Order rewrites fn->nbody to apply the ordering constraints
+// Order rewrites fn.Nbody to apply the ordering constraints
 // described in the comment at the top of the file.
 func order(fn *Node) {
 	if Debug['W'] > 1 {
@@ -54,32 +54,25 @@ func order(fn *Node) {
 		dumplist(s, fn.Nbody)
 	}
 
-	orderblock(&fn.Nbody)
+	orderBlock(&fn.Nbody)
 }
 
-// Ordertemp allocates a new temporary with the given type,
+// newTemp allocates a new temporary with the given type,
 // pushes it onto the temp stack, and returns it.
-// If clear is true, ordertemp emits code to zero the temporary.
-func ordertemp(t *Type, order *Order, clear bool) *Node {
-	var_ := temp(t)
+// If clear is true, newTemp emits code to zero the temporary.
+func (o *Order) newTemp(t *types.Type, clear bool) *Node {
+	v := temp(t)
 	if clear {
-		a := Nod(OAS, var_, nil)
-		typecheck(&a, Etop)
-		order.out = list(order.out, a)
+		a := nod(OAS, v, nil)
+		a = typecheck(a, Etop)
+		o.out = append(o.out, a)
 	}
 
-	l := order.free
-	if l == nil {
-		l = new(NodeList)
-	}
-	order.free = l.Next
-	l.Next = order.temp
-	l.N = var_
-	order.temp = l
-	return var_
+	o.temp = append(o.temp, v)
+	return v
 }
 
-// Ordercopyexpr behaves like ordertemp but also emits
+// copyExpr behaves like ordertemp but also emits
 // code to initialize the temporary to the value n.
 //
 // The clear argument is provided for use when the evaluation
@@ -91,107 +84,93 @@ func ordertemp(t *Type, order *Order, clear bool) *Node {
 // (The other candidate would be map access, but map access
 // returns a pointer to the result data instead of taking a pointer
 // to be filled in.)
-func ordercopyexpr(n *Node, t *Type, order *Order, clear int) *Node {
-	var_ := ordertemp(t, order, clear != 0)
-	a := Nod(OAS, var_, n)
-	typecheck(&a, Etop)
-	order.out = list(order.out, a)
-	return var_
+func (o *Order) copyExpr(n *Node, t *types.Type, clear bool) *Node {
+	v := o.newTemp(t, clear)
+	a := nod(OAS, v, n)
+	a = typecheck(a, Etop)
+	o.out = append(o.out, a)
+	return v
 }
 
-// Ordercheapexpr returns a cheap version of n.
+// cheapExpr returns a cheap version of n.
 // The definition of cheap is that n is a variable or constant.
-// If not, ordercheapexpr allocates a new tmp, emits tmp = n,
+// If not, cheapExpr allocates a new tmp, emits tmp = n,
 // and then returns tmp.
-func ordercheapexpr(n *Node, order *Order) *Node {
+func (o *Order) cheapExpr(n *Node) *Node {
 	if n == nil {
 		return nil
 	}
+
 	switch n.Op {
 	case ONAME, OLITERAL:
 		return n
 	case OLEN, OCAP:
-		l := ordercheapexpr(n.Left, order)
+		l := o.cheapExpr(n.Left)
 		if l == n.Left {
 			return n
 		}
-		a := Nod(OXXX, nil, nil)
-		*a = *n
-		a.Orig = a
+		a := *n
+		a.Orig = &a
 		a.Left = l
-		typecheck(&a, Erv)
-		return a
+		return typecheck(&a, Erv)
 	}
 
-	return ordercopyexpr(n, n.Type, order, 0)
+	return o.copyExpr(n, n.Type, false)
 }
 
-// Ordersafeexpr returns a safe version of n.
+// safeExpr returns a safe version of n.
 // The definition of safe is that n can appear multiple times
 // without violating the semantics of the original program,
 // and that assigning to the safe version has the same effect
 // as assigning to the original n.
 //
 // The intended use is to apply to x when rewriting x += y into x = x + y.
-func ordersafeexpr(n *Node, order *Order) *Node {
+func (o *Order) safeExpr(n *Node) *Node {
 	switch n.Op {
 	case ONAME, OLITERAL:
 		return n
 
 	case ODOT, OLEN, OCAP:
-		l := ordersafeexpr(n.Left, order)
+		l := o.safeExpr(n.Left)
 		if l == n.Left {
 			return n
 		}
-		a := Nod(OXXX, nil, nil)
-		*a = *n
-		a.Orig = a
+		a := *n
+		a.Orig = &a
 		a.Left = l
-		typecheck(&a, Erv)
-		return a
+		return typecheck(&a, Erv)
 
 	case ODOTPTR, OIND:
-		l := ordercheapexpr(n.Left, order)
+		l := o.cheapExpr(n.Left)
 		if l == n.Left {
 			return n
 		}
-		a := Nod(OXXX, nil, nil)
-		*a = *n
-		a.Orig = a
+		a := *n
+		a.Orig = &a
 		a.Left = l
-		typecheck(&a, Erv)
-		return a
+		return typecheck(&a, Erv)
 
 	case OINDEX, OINDEXMAP:
 		var l *Node
-		if Isfixedarray(n.Left.Type) {
-			l = ordersafeexpr(n.Left, order)
+		if n.Left.Type.IsArray() {
+			l = o.safeExpr(n.Left)
 		} else {
-			l = ordercheapexpr(n.Left, order)
+			l = o.cheapExpr(n.Left)
 		}
-		r := ordercheapexpr(n.Right, order)
+		r := o.cheapExpr(n.Right)
 		if l == n.Left && r == n.Right {
 			return n
 		}
-		a := Nod(OXXX, nil, nil)
-		*a = *n
-		a.Orig = a
+		a := *n
+		a.Orig = &a
 		a.Left = l
 		a.Right = r
-		typecheck(&a, Erv)
-		return a
-	}
+		return typecheck(&a, Erv)
 
-	Fatal("ordersafeexpr %v", Oconv(int(n.Op), 0))
-	return nil // not reached
-}
-
-// Istemp reports whether n is a temporary variable.
-func istemp(n *Node) bool {
-	if n.Op != ONAME {
-		return false
+	default:
+		Fatalf("ordersafeexpr %v", n.Op)
+		return nil // not reached
 	}
-	return strings.HasPrefix(n.Sym.Name, "autotmp_")
 }
 
 // Isaddrokay reports whether it is okay to pass n's address to runtime routines.
@@ -201,124 +180,151 @@ func istemp(n *Node) bool {
 // because we emit explicit VARKILL instructions marking the end of those
 // temporaries' lifetimes.
 func isaddrokay(n *Node) bool {
-	return islvalue(n) && (n.Op != ONAME || n.Class == PEXTERN || istemp(n))
+	return islvalue(n) && (n.Op != ONAME || n.Class() == PEXTERN || n.IsAutoTmp())
 }
 
-// Orderaddrtemp ensures that *np is okay to pass by address to runtime routines.
-// If the original argument *np is not okay, orderaddrtemp creates a tmp, emits
-// tmp = *np, and then sets *np to the tmp variable.
-func orderaddrtemp(np **Node, order *Order) {
-	n := *np
-	if isaddrokay(n) {
-		return
+// addrTemp ensures that n is okay to pass by address to runtime routines.
+// If the original argument n is not okay, addrTemp creates a tmp, emits
+// tmp = n, and then returns tmp.
+// The result of addrTemp MUST be assigned back to n, e.g.
+// 	n.Left = o.addrTemp(n.Left)
+func (o *Order) addrTemp(n *Node) *Node {
+	if consttype(n) > 0 {
+		// TODO: expand this to all static composite literal nodes?
+		n = defaultlit(n, nil)
+		dowidth(n.Type)
+		vstat := staticname(n.Type)
+		vstat.Name.SetReadonly(true)
+		var out []*Node
+		staticassign(vstat, n, &out)
+		if out != nil {
+			Fatalf("staticassign of const generated code: %+v", n)
+		}
+		vstat = typecheck(vstat, Erv)
+		return vstat
 	}
-	*np = ordercopyexpr(n, n.Type, order, 0)
+	if isaddrokay(n) {
+		return n
+	}
+	return o.copyExpr(n, n.Type, false)
 }
+
+// mapKeyTemp prepares n to be a key in a map runtime call and returns n.
+// It should only be used for map runtime calls which have *_fast* versions.
+func (o *Order) mapKeyTemp(t *types.Type, n *Node) *Node {
+	// Most map calls need to take the address of the key.
+	// Exception: map*_fast* calls. See golang.org/issue/19015.
+	if mapfast(t) == mapslow {
+		return o.addrTemp(n)
+	}
+	return n
+}
+
+type ordermarker int
 
 // Marktemp returns the top of the temporary variable stack.
-func marktemp(order *Order) *NodeList {
-	return order.temp
+func (o *Order) markTemp() ordermarker {
+	return ordermarker(len(o.temp))
 }
 
 // Poptemp pops temporaries off the stack until reaching the mark,
 // which must have been returned by marktemp.
-func poptemp(mark *NodeList, order *Order) {
-	var l *NodeList
+func (o *Order) popTemp(mark ordermarker) {
+	o.temp = o.temp[:mark]
+}
 
-	for {
-		l = order.temp
-		if l == mark {
-			break
+// Cleantempnopop emits VARKILL and if needed VARLIVE instructions
+// to *out for each temporary above the mark on the temporary stack.
+// It does not pop the temporaries from the stack.
+func (o *Order) cleanTempNoPop(mark ordermarker, out *[]*Node) {
+	for i := len(o.temp) - 1; i >= int(mark); i-- {
+		n := o.temp[i]
+		if n.Name.Keepalive() {
+			n.Name.SetKeepalive(false)
+			n.SetAddrtaken(true) // ensure SSA keeps the n variable
+			live := nod(OVARLIVE, n, nil)
+			live = typecheck(live, Etop)
+			*out = append(*out, live)
 		}
-		order.temp = l.Next
-		l.Next = order.free
-		order.free = l
+		kill := nod(OVARKILL, n, nil)
+		kill = typecheck(kill, Etop)
+		*out = append(*out, kill)
 	}
 }
 
-// Cleantempnopop emits to *out VARKILL instructions for each temporary
-// above the mark on the temporary stack, but it does not pop them
-// from the stack.
-func cleantempnopop(mark *NodeList, order *Order, out **NodeList) {
-	var kill *Node
-
-	for l := order.temp; l != mark; l = l.Next {
-		kill = Nod(OVARKILL, l.N, nil)
-		typecheck(&kill, Etop)
-		*out = list(*out, kill)
-	}
-}
-
-// Cleantemp emits VARKILL instructions for each temporary above the
+// cleanTemp emits VARKILL instructions for each temporary above the
 // mark on the temporary stack and removes them from the stack.
-func cleantemp(top *NodeList, order *Order) {
-	cleantempnopop(top, order, &order.out)
-	poptemp(top, order)
+func (o *Order) cleanTemp(top ordermarker) {
+	o.cleanTempNoPop(top, &o.out)
+	o.popTemp(top)
 }
 
-// Orderstmtlist orders each of the statements in the list.
-func orderstmtlist(l *NodeList, order *Order) {
-	for ; l != nil; l = l.Next {
-		orderstmt(l.N, order)
+// stmtList orders each of the statements in the list.
+func (o *Order) stmtList(l Nodes) {
+	for _, n := range l.Slice() {
+		o.stmt(n)
 	}
 }
 
-// Orderblock orders the block of statements *l onto a new list,
-// and then replaces *l with that list.
-func orderblock(l **NodeList) {
+// orderBlock orders the block of statements in n into a new slice,
+// and then replaces the old slice in n with the new slice.
+func orderBlock(n *Nodes) {
 	var order Order
-	mark := marktemp(&order)
-	orderstmtlist(*l, &order)
-	cleantemp(mark, &order)
-	*l = order.out
+	mark := order.markTemp()
+	order.stmtList(*n)
+	order.cleanTemp(mark)
+	n.Set(order.out)
 }
 
-// Orderexprinplace orders the side effects in *np and
+// exprInPlace orders the side effects in *np and
 // leaves them as the init list of the final *np.
-func orderexprinplace(np **Node, outer *Order) {
-	n := *np
+// The result of exprInPlace MUST be assigned back to n, e.g.
+// 	n.Left = o.exprInPlace(n.Left)
+func (o *Order) exprInPlace(n *Node) *Node {
 	var order Order
-	orderexpr(&n, &order, nil)
-	addinit(&n, order.out)
+	n = order.expr(n, nil)
+	n = addinit(n, order.out)
 
 	// insert new temporaries from order
 	// at head of outer list.
-	lp := &order.temp
-
-	for *lp != nil {
-		lp = &(*lp).Next
-	}
-	*lp = outer.temp
-	outer.temp = order.temp
-
-	*np = n
+	o.temp = append(o.temp, order.temp...)
+	return n
 }
 
-// Orderstmtinplace orders the side effects of the single statement *np
+// orderStmtInPlace orders the side effects of the single statement *np
 // and replaces it with the resulting statement list.
-func orderstmtinplace(np **Node) {
-	n := *np
+// The result of orderStmtInPlace MUST be assigned back to n, e.g.
+// 	n.Left = orderStmtInPlace(n.Left)
+func orderStmtInPlace(n *Node) *Node {
 	var order Order
-	mark := marktemp(&order)
-	orderstmt(n, &order)
-	cleantemp(mark, &order)
-	*np = liststmt(order.out)
+	mark := order.markTemp()
+	order.stmt(n)
+	order.cleanTemp(mark)
+	return liststmt(order.out)
 }
 
-// Orderinit moves n's init list to order->out.
-func orderinit(n *Node, order *Order) {
-	orderstmtlist(n.Ninit, order)
-	n.Ninit = nil
+// init moves n's init list to o.out.
+func (o *Order) init(n *Node) {
+	if n.mayBeShared() {
+		// For concurrency safety, don't mutate potentially shared nodes.
+		// First, ensure that no work is required here.
+		if n.Ninit.Len() > 0 {
+			Fatalf("orderinit shared node with ninit")
+		}
+		return
+	}
+	o.stmtList(n.Ninit)
+	n.Ninit.Set(nil)
 }
 
 // Ismulticall reports whether the list l is f() for a multi-value function.
 // Such an f() could appear as the lone argument to a multi-arg function.
-func ismulticall(l *NodeList) bool {
+func ismulticall(l Nodes) bool {
 	// one arg only
-	if l == nil || l.Next != nil {
+	if l.Len() != 1 {
 		return false
 	}
-	n := l.N
+	n := l.First()
 
 	// must be call
 	switch n.Op {
@@ -330,143 +336,162 @@ func ismulticall(l *NodeList) bool {
 	}
 
 	// call must return multiple values
-	return n.Left.Type.Outtuple > 1
+	return n.Left.Type.NumResults() > 1
 }
 
-// Copyret emits t1, t2, ... = n, where n is a function call,
+// copyRet emits t1, t2, ... = n, where n is a function call,
 // and then returns the list t1, t2, ....
-func copyret(n *Node, order *Order) *NodeList {
-	if n.Type.Etype != TSTRUCT || n.Type.Funarg == 0 {
-		Fatal("copyret %v %d", n.Type, n.Left.Type.Outtuple)
+func (o *Order) copyRet(n *Node) []*Node {
+	if !n.Type.IsFuncArgStruct() {
+		Fatalf("copyret %v %d", n.Type, n.Left.Type.NumResults())
 	}
 
-	var l1 *NodeList
-	var l2 *NodeList
-	var tl Iter
-	var tmp *Node
-	for t := Structfirst(&tl, &n.Type); t != nil; t = structnext(&tl) {
-		tmp = temp(t.Type)
-		l1 = list(l1, tmp)
-		l2 = list(l2, tmp)
+	var l1, l2 []*Node
+	for _, f := range n.Type.Fields().Slice() {
+		tmp := temp(f.Type)
+		l1 = append(l1, tmp)
+		l2 = append(l2, tmp)
 	}
 
-	as := Nod(OAS2, nil, nil)
-	as.List = l1
-	as.Rlist = list1(n)
-	typecheck(&as, Etop)
-	orderstmt(as, order)
+	as := nod(OAS2, nil, nil)
+	as.List.Set(l1)
+	as.Rlist.Set1(n)
+	as = typecheck(as, Etop)
+	o.stmt(as)
 
 	return l2
 }
 
-// Ordercallargs orders the list of call arguments *l.
-func ordercallargs(l **NodeList, order *Order) {
+// callArgs orders the list of call arguments *l.
+func (o *Order) callArgs(l *Nodes) {
 	if ismulticall(*l) {
 		// return f() where f() is multiple values.
-		*l = copyret((*l).N, order)
+		l.Set(o.copyRet(l.First()))
 	} else {
-		orderexprlist(*l, order)
+		o.exprList(*l)
 	}
 }
 
-// Ordercall orders the call expression n.
-// n->op is OCALLMETH/OCALLFUNC/OCALLINTER or a builtin like OCOPY.
-func ordercall(n *Node, order *Order) {
-	orderexpr(&n.Left, order, nil)
-	orderexpr(&n.Right, order, nil) // ODDDARG temp
-	ordercallargs(&n.List, order)
+// call orders the call expression n.
+// n.Op is OCALLMETH/OCALLFUNC/OCALLINTER or a builtin like OCOPY.
+func (o *Order) call(n *Node) {
+	n.Left = o.expr(n.Left, nil)
+	n.Right = o.expr(n.Right, nil) // ODDDARG temp
+	o.callArgs(&n.List)
+
+	if n.Op == OCALLFUNC {
+		keepAlive := func(i int) {
+			// If the argument is really a pointer being converted to uintptr,
+			// arrange for the pointer to be kept alive until the call returns,
+			// by copying it into a temp and marking that temp
+			// still alive when we pop the temp stack.
+			xp := n.List.Addr(i)
+			for (*xp).Op == OCONVNOP && !(*xp).Type.IsUnsafePtr() {
+				xp = &(*xp).Left
+			}
+			x := *xp
+			if x.Type.IsUnsafePtr() {
+				x = o.copyExpr(x, x.Type, false)
+				x.Name.SetKeepalive(true)
+				*xp = x
+			}
+		}
+
+		for i, t := range n.Left.Type.Params().FieldSlice() {
+			// Check for "unsafe-uintptr" tag provided by escape analysis.
+			if t.Isddd() && !n.Isddd() {
+				if t.Note == uintptrEscapesTag {
+					for ; i < n.List.Len(); i++ {
+						keepAlive(i)
+					}
+				}
+			} else {
+				if t.Note == unsafeUintptrTag || t.Note == uintptrEscapesTag {
+					keepAlive(i)
+				}
+			}
+		}
+	}
 }
 
-// Ordermapassign appends n to order->out, introducing temporaries
-// to make sure that all map assignments have the form m[k] = x,
-// where x is adressable.
-// (Orderexpr has already been called on n, so we know k is addressable.)
+// mapAssign appends n to o.out, introducing temporaries
+// to make sure that all map assignments have the form m[k] = x.
+// (Note: expr has already been called on n, so we know k is addressable.)
 //
-// If n is m[k] = x where x is not addressable, the rewrite is:
-//	tmp = x
-//	m[k] = tmp
-//
-// If n is the multiple assignment form ..., m[k], ... = ..., the rewrite is
+// If n is the multiple assignment form ..., m[k], ... = ..., x, ..., the rewrite is
 //	t1 = m
 //	t2 = k
-//	...., t3, ... = x
+//	...., t3, ... = ..., x, ...
 //	t1[t2] = t3
 //
 // The temporaries t1, t2 are needed in case the ... being assigned
 // contain m or k. They are usually unnecessary, but in the unnecessary
 // cases they are also typically registerizable, so not much harm done.
 // And this only applies to the multiple-assignment form.
-// We could do a more precise analysis if needed, like in walk.c.
-//
-// Ordermapassign also inserts these temporaries if needed for
-// calling writebarrierfat with a pointer to n->right.
-func ordermapassign(n *Node, order *Order) {
+// We could do a more precise analysis if needed, like in walk.go.
+func (o *Order) mapAssign(n *Node) {
 	switch n.Op {
 	default:
-		Fatal("ordermapassign %v", Oconv(int(n.Op), 0))
+		Fatalf("ordermapassign %v", n.Op)
 
-	case OAS:
-		order.out = list(order.out, n)
-
-		// We call writebarrierfat only for values > 4 pointers long. See walk.c.
-		if (n.Left.Op == OINDEXMAP || (needwritebarrier(n.Left, n.Right) && n.Left.Type.Width > int64(4*Widthptr))) && !isaddrokay(n.Right) {
-			m := n.Left
-			n.Left = ordertemp(m.Type, order, false)
-			a := Nod(OAS, m, n.Left)
-			typecheck(&a, Etop)
-			order.out = list(order.out, a)
+	case OAS, OASOP:
+		if n.Left.Op == OINDEXMAP {
+			// Make sure we evaluate the RHS before starting the map insert.
+			// We need to make sure the RHS won't panic.  See issue 22881.
+			n.Right = o.cheapExpr(n.Right)
 		}
+		o.out = append(o.out, n)
 
 	case OAS2, OAS2DOTTYPE, OAS2MAPR, OAS2FUNC:
-		var post *NodeList
-		var m *Node
-		var a *Node
-		for l := n.List; l != nil; l = l.Next {
-			if l.N.Op == OINDEXMAP {
-				m = l.N
-				if !istemp(m.Left) {
-					m.Left = ordercopyexpr(m.Left, m.Left.Type, order, 0)
+		var post []*Node
+		for i, m := range n.List.Slice() {
+			switch {
+			case m.Op == OINDEXMAP:
+				if !m.Left.IsAutoTmp() {
+					m.Left = o.copyExpr(m.Left, m.Left.Type, false)
 				}
-				if !istemp(m.Right) {
-					m.Right = ordercopyexpr(m.Right, m.Right.Type, order, 0)
+				if !m.Right.IsAutoTmp() {
+					m.Right = o.copyExpr(m.Right, m.Right.Type, false)
 				}
-				l.N = ordertemp(m.Type, order, false)
-				a = Nod(OAS, m, l.N)
-				typecheck(&a, Etop)
-				post = list(post, a)
+				fallthrough
+			case instrumenting && n.Op == OAS2FUNC && !isblank(m):
+				t := o.newTemp(m.Type, false)
+				n.List.SetIndex(i, t)
+				a := nod(OAS, m, t)
+				a = typecheck(a, Etop)
+				post = append(post, a)
 			}
 		}
 
-		order.out = list(order.out, n)
-		order.out = concat(order.out, post)
+		o.out = append(o.out, n)
+		o.out = append(o.out, post...)
 	}
 }
 
-// Orderstmt orders the statement n, appending to order->out.
+// stmt orders the statement n, appending to o.out.
 // Temporaries created during the statement are cleaned
 // up using VARKILL instructions as possible.
-func orderstmt(n *Node, order *Order) {
+func (o *Order) stmt(n *Node) {
 	if n == nil {
 		return
 	}
 
-	lno := int(setlineno(n))
-
-	orderinit(n, order)
+	lno := setlineno(n)
+	o.init(n)
 
 	switch n.Op {
 	default:
-		Fatal("orderstmt %v", Oconv(int(n.Op), 0))
+		Fatalf("orderstmt %v", n.Op)
 
-	case OVARKILL:
-		order.out = list(order.out, n)
+	case OVARKILL, OVARLIVE:
+		o.out = append(o.out, n)
 
 	case OAS:
-		t := marktemp(order)
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right, order, n.Left)
-		ordermapassign(n, order)
-		cleantemp(t, order)
+		t := o.markTemp()
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, n.Left)
+		o.mapAssign(n)
+		o.cleanTemp(t)
 
 	case OAS2,
 		OCLOSE,
@@ -475,282 +500,246 @@ func orderstmt(n *Node, order *Order) {
 		OPRINTN,
 		ORECOVER,
 		ORECV:
-		t := marktemp(order)
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right, order, nil)
-		orderexprlist(n.List, order)
-		orderexprlist(n.Rlist, order)
+		t := o.markTemp()
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
+		o.exprList(n.List)
+		o.exprList(n.Rlist)
 		switch n.Op {
-		case OAS2, OAS2DOTTYPE:
-			ordermapassign(n, order)
+		case OAS2:
+			o.mapAssign(n)
 		default:
-			order.out = list(order.out, n)
+			o.out = append(o.out, n)
 		}
-		cleantemp(t, order)
+		o.cleanTemp(t)
 
 	case OASOP:
-		// Special: rewrite l op= r into l = l op r.
-		// This simplies quite a few operations;
-		// most important is that it lets us separate
-		// out map read from map write when l is
-		// a map index expression.
-		t := marktemp(order)
+		t := o.markTemp()
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
 
-		orderexpr(&n.Left, order, nil)
-		n.Left = ordersafeexpr(n.Left, order)
-		tmp1 := treecopy(n.Left, 0)
-		if tmp1.Op == OINDEXMAP {
-			tmp1.Etype = 0 // now an rvalue not an lvalue
+		if instrumenting || n.Left.Op == OINDEXMAP && (n.SubOp() == ODIV || n.SubOp() == OMOD) {
+			// Rewrite m[k] op= r into m[k] = m[k] op r so
+			// that we can ensure that if op panics
+			// because r is zero, the panic happens before
+			// the map assignment.
+
+			n.Left = o.safeExpr(n.Left)
+
+			l := treecopy(n.Left, src.NoXPos)
+			if l.Op == OINDEXMAP {
+				l.SetIndexMapLValue(false)
+			}
+			l = o.copyExpr(l, n.Left.Type, false)
+			n.Right = nod(n.SubOp(), l, n.Right)
+			n.Right = typecheck(n.Right, Erv)
+			n.Right = o.expr(n.Right, nil)
+
+			n.Op = OAS
+			n.ResetAux()
 		}
-		tmp1 = ordercopyexpr(tmp1, n.Left.Type, order, 0)
-		n.Right = Nod(int(n.Etype), tmp1, n.Right)
-		typecheck(&n.Right, Erv)
-		orderexpr(&n.Right, order, nil)
-		n.Etype = 0
-		n.Op = OAS
-		ordermapassign(n, order)
-		cleantemp(t, order)
 
-		// Special: make sure key is addressable,
+		o.mapAssign(n)
+		o.cleanTemp(t)
+
+	// Special: make sure key is addressable if needed,
 	// and make sure OINDEXMAP is not copied out.
 	case OAS2MAPR:
-		t := marktemp(order)
-
-		orderexprlist(n.List, order)
-		r := n.Rlist.N
-		orderexpr(&r.Left, order, nil)
-		orderexpr(&r.Right, order, nil)
+		t := o.markTemp()
+		o.exprList(n.List)
+		r := n.Rlist.First()
+		r.Left = o.expr(r.Left, nil)
+		r.Right = o.expr(r.Right, nil)
 
 		// See case OINDEXMAP below.
 		if r.Right.Op == OARRAYBYTESTR {
 			r.Right.Op = OARRAYBYTESTRTMP
 		}
-		orderaddrtemp(&r.Right, order)
-		ordermapassign(n, order)
-		cleantemp(t, order)
+		r.Right = o.mapKeyTemp(r.Left.Type, r.Right)
+		o.okAs2(n)
+		o.cleanTemp(t)
 
-		// Special: avoid copy of func call n->rlist->n.
+	// Special: avoid copy of func call n.Rlist.First().
 	case OAS2FUNC:
-		t := marktemp(order)
+		t := o.markTemp()
+		o.exprList(n.List)
+		o.call(n.Rlist.First())
+		o.as2(n)
+		o.cleanTemp(t)
 
-		orderexprlist(n.List, order)
-		ordercall(n.Rlist.N, order)
-		ordermapassign(n, order)
-		cleantemp(t, order)
-
-		// Special: use temporary variables to hold result,
+	// Special: use temporary variables to hold result,
 	// so that assertI2Tetc can take address of temporary.
 	// No temporary for blank assignment.
 	case OAS2DOTTYPE:
-		t := marktemp(order)
+		t := o.markTemp()
+		o.exprList(n.List)
+		n.Rlist.First().Left = o.expr(n.Rlist.First().Left, nil) // i in i.(T)
+		o.okAs2(n)
+		o.cleanTemp(t)
 
-		orderexprlist(n.List, order)
-		orderexpr(&n.Rlist.N.Left, order, nil) // i in i.(T)
-		if isblank(n.List.N) {
-			order.out = list(order.out, n)
-		} else {
-			typ := n.Rlist.N.Type
-			tmp1 := ordertemp(typ, order, haspointers(typ))
-			order.out = list(order.out, n)
-			r := Nod(OAS, n.List.N, tmp1)
-			typecheck(&r, Etop)
-			ordermapassign(r, order)
-			n.List = list(list1(tmp1), n.List.Next.N)
-		}
-
-		cleantemp(t, order)
-
-		// Special: use temporary variables to hold result,
+	// Special: use temporary variables to hold result,
 	// so that chanrecv can take address of temporary.
 	case OAS2RECV:
-		t := marktemp(order)
+		t := o.markTemp()
+		o.exprList(n.List)
+		n.Rlist.First().Left = o.expr(n.Rlist.First().Left, nil) // arg to recv
+		ch := n.Rlist.First().Left.Type
+		tmp1 := o.newTemp(ch.Elem(), types.Haspointers(ch.Elem()))
+		tmp2 := o.newTemp(types.Types[TBOOL], false)
+		o.out = append(o.out, n)
+		r := nod(OAS, n.List.First(), tmp1)
+		r = typecheck(r, Etop)
+		o.mapAssign(r)
+		r = okas(n.List.Second(), tmp2)
+		r = typecheck(r, Etop)
+		o.mapAssign(r)
+		n.List.Set2(tmp1, tmp2)
+		o.cleanTemp(t)
 
-		orderexprlist(n.List, order)
-		orderexpr(&n.Rlist.N.Left, order, nil) // arg to recv
-		ch := n.Rlist.N.Left.Type
-		tmp1 := ordertemp(ch.Type, order, haspointers(ch.Type))
-		var tmp2 *Node
-		if !isblank(n.List.Next.N) {
-			tmp2 = ordertemp(n.List.Next.N.Type, order, false)
-		} else {
-			tmp2 = ordertemp(Types[TBOOL], order, false)
-		}
-		order.out = list(order.out, n)
-		r := Nod(OAS, n.List.N, tmp1)
-		typecheck(&r, Etop)
-		ordermapassign(r, order)
-		r = Nod(OAS, n.List.Next.N, tmp2)
-		typecheck(&r, Etop)
-		ordermapassign(r, order)
-		n.List = list(list1(tmp1), tmp2)
-		cleantemp(t, order)
-
-		// Special: does not save n onto out.
+	// Special: does not save n onto out.
 	case OBLOCK, OEMPTY:
-		orderstmtlist(n.List, order)
+		o.stmtList(n.List)
 
-		// Special: n->left is not an expression; save as is.
+	// Special: n->left is not an expression; save as is.
 	case OBREAK,
 		OCONTINUE,
 		ODCL,
 		ODCLCONST,
 		ODCLTYPE,
 		OFALL,
-		OXFALL,
 		OGOTO,
 		OLABEL,
 		ORETJMP:
-		order.out = list(order.out, n)
+		o.out = append(o.out, n)
 
-		// Special: handle call arguments.
+	// Special: handle call arguments.
 	case OCALLFUNC, OCALLINTER, OCALLMETH:
-		t := marktemp(order)
+		t := o.markTemp()
+		o.call(n)
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 
-		ordercall(n, order)
-		order.out = list(order.out, n)
-		cleantemp(t, order)
-
-		// Special: order arguments to inner call but not call itself.
+	// Special: order arguments to inner call but not call itself.
 	case ODEFER, OPROC:
-		t := marktemp(order)
-
-		switch n.Left.Op {
-		// Delete will take the address of the key.
-		// Copy key into new temp and do not clean it
-		// (it persists beyond the statement).
-		case ODELETE:
-			orderexprlist(n.Left.List, order)
-
-			t1 := marktemp(order)
-			np := &n.Left.List.Next.N // map key
-			*np = ordercopyexpr(*np, (*np).Type, order, 0)
-			poptemp(t1, order)
-
-		default:
-			ordercall(n.Left, order)
-		}
-
-		order.out = list(order.out, n)
-		cleantemp(t, order)
+		t := o.markTemp()
+		o.call(n.Left)
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 
 	case ODELETE:
-		t := marktemp(order)
-		orderexpr(&n.List.N, order, nil)
-		orderexpr(&n.List.Next.N, order, nil)
-		orderaddrtemp(&n.List.Next.N, order) // map key
-		order.out = list(order.out, n)
-		cleantemp(t, order)
+		t := o.markTemp()
+		n.List.SetFirst(o.expr(n.List.First(), nil))
+		n.List.SetSecond(o.expr(n.List.Second(), nil))
+		n.List.SetSecond(o.mapKeyTemp(n.List.First().Type, n.List.Second()))
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 
-		// Clean temporaries from condition evaluation at
+	// Clean temporaries from condition evaluation at
 	// beginning of loop body and after for statement.
 	case OFOR:
-		t := marktemp(order)
+		t := o.markTemp()
+		n.Left = o.exprInPlace(n.Left)
+		var l []*Node
+		o.cleanTempNoPop(t, &l)
+		n.Nbody.Prepend(l...)
+		orderBlock(&n.Nbody)
+		n.Right = orderStmtInPlace(n.Right)
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 
-		orderexprinplace(&n.Left, order)
-		var l *NodeList
-		cleantempnopop(t, order, &l)
-		n.Nbody = concat(l, n.Nbody)
-		orderblock(&n.Nbody)
-		orderstmtinplace(&n.Right)
-		order.out = list(order.out, n)
-		cleantemp(t, order)
-
-		// Clean temporaries from condition at
+	// Clean temporaries from condition at
 	// beginning of both branches.
 	case OIF:
-		t := marktemp(order)
-
-		orderexprinplace(&n.Left, order)
-		var l *NodeList
-		cleantempnopop(t, order, &l)
-		n.Nbody = concat(l, n.Nbody)
+		t := o.markTemp()
+		n.Left = o.exprInPlace(n.Left)
+		var l []*Node
+		o.cleanTempNoPop(t, &l)
+		n.Nbody.Prepend(l...)
 		l = nil
-		cleantempnopop(t, order, &l)
-		n.Rlist = concat(l, n.Rlist)
-		poptemp(t, order)
-		orderblock(&n.Nbody)
-		orderblock(&n.Rlist)
-		order.out = list(order.out, n)
+		o.cleanTempNoPop(t, &l)
+		n.Rlist.Prepend(l...)
+		o.popTemp(t)
+		orderBlock(&n.Nbody)
+		orderBlock(&n.Rlist)
+		o.out = append(o.out, n)
 
-		// Special: argument will be converted to interface using convT2E
+	// Special: argument will be converted to interface using convT2E
 	// so make sure it is an addressable temporary.
 	case OPANIC:
-		t := marktemp(order)
-
-		orderexpr(&n.Left, order, nil)
-		if !Isinter(n.Left.Type) {
-			orderaddrtemp(&n.Left, order)
+		t := o.markTemp()
+		n.Left = o.expr(n.Left, nil)
+		if !n.Left.Type.IsInterface() {
+			n.Left = o.addrTemp(n.Left)
 		}
-		order.out = list(order.out, n)
-		cleantemp(t, order)
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 
-		// n->right is the expression being ranged over.
-	// order it, and then make a copy if we need one.
-	// We almost always do, to ensure that we don't
-	// see any value changes made during the loop.
-	// Usually the copy is cheap (e.g., array pointer, chan, slice, string are all tiny).
-	// The exception is ranging over an array value (not a slice, not a pointer to array),
-	// which must make a copy to avoid seeing updates made during
-	// the range body. Ranging over an array value is uncommon though.
 	case ORANGE:
-		t := marktemp(order)
+		// n.Right is the expression being ranged over.
+		// order it, and then make a copy if we need one.
+		// We almost always do, to ensure that we don't
+		// see any value changes made during the loop.
+		// Usually the copy is cheap (e.g., array pointer,
+		// chan, slice, string are all tiny).
+		// The exception is ranging over an array value
+		// (not a slice, not a pointer to array),
+		// which must make a copy to avoid seeing updates made during
+		// the range body. Ranging over an array value is uncommon though.
 
-		orderexpr(&n.Right, order, nil)
+		// Mark []byte(str) range expression to reuse string backing storage.
+		// It is safe because the storage cannot be mutated.
+		if n.Right.Op == OSTRARRAYBYTE {
+			n.Right.Op = OSTRARRAYBYTETMP
+		}
+
+		t := o.markTemp()
+		n.Right = o.expr(n.Right, nil)
 		switch n.Type.Etype {
 		default:
-			Fatal("orderstmt range %v", n.Type)
+			Fatalf("orderstmt range %v", n.Type)
 
-			// Mark []byte(str) range expression to reuse string backing storage.
-		// It is safe because the storage cannot be mutated.
-		case TARRAY:
-			if n.Right.Op == OSTRARRAYBYTE {
-				n.Right.Op = OSTRARRAYBYTETMP
-			}
-			if count(n.List) < 2 || isblank(n.List.Next.N) {
+		case TARRAY, TSLICE:
+			if n.List.Len() < 2 || isblank(n.List.Second()) {
 				// for i := range x will only use x once, to compute len(x).
 				// No need to copy it.
 				break
 			}
 			fallthrough
 
-			// chan, string, slice, array ranges use value multiple times.
-		// make copy.
-		// fall through
 		case TCHAN, TSTRING:
+			// chan, string, slice, array ranges use value multiple times.
+			// make copy.
 			r := n.Right
 
-			if r.Type.Etype == TSTRING && r.Type != Types[TSTRING] {
-				r = Nod(OCONV, r, nil)
-				r.Type = Types[TSTRING]
-				typecheck(&r, Erv)
+			if r.Type.IsString() && r.Type != types.Types[TSTRING] {
+				r = nod(OCONV, r, nil)
+				r.Type = types.Types[TSTRING]
+				r = typecheck(r, Erv)
 			}
 
-			n.Right = ordercopyexpr(r, r.Type, order, 0)
+			n.Right = o.copyExpr(r, r.Type, false)
 
-			// copy the map value in case it is a map literal.
-		// TODO(rsc): Make tmp = literal expressions reuse tmp.
-		// For maps tmp is just one word so it hardly matters.
 		case TMAP:
+			// copy the map value in case it is a map literal.
+			// TODO(rsc): Make tmp = literal expressions reuse tmp.
+			// For maps tmp is just one word so it hardly matters.
 			r := n.Right
+			n.Right = o.copyExpr(r, r.Type, false)
 
-			n.Right = ordercopyexpr(r, r.Type, order, 0)
-
-			// n->alloc is the temp for the iterator.
-			prealloc[n] = ordertemp(Types[TUINT8], order, true)
+			// prealloc[n] is the temp for the iterator.
+			// hiter contains pointers and needs to be zeroed.
+			prealloc[n] = o.newTemp(hiter(n.Type), true)
 		}
-
-		for l := n.List; l != nil; l = l.Next {
-			orderexprinplace(&l.N, order)
-		}
-		orderblock(&n.Nbody)
-		order.out = list(order.out, n)
-		cleantemp(t, order)
+		o.exprListInPlace(n.List)
+		orderBlock(&n.Nbody)
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 
 	case ORETURN:
-		ordercallargs(&n.List, order)
-		order.out = list(order.out, n)
+		o.callArgs(&n.List)
+		o.out = append(o.out, n)
 
-		// Special: clean case temporaries in each block entry.
+	// Special: clean case temporaries in each block entry.
 	// Select must enter one of its blocks, so there is no
 	// need for a cleaning at the end.
 	// Doubly special: evaluation order for select is stricter
@@ -760,50 +749,47 @@ func orderstmt(n *Node, order *Order) {
 	// case (if p were nil, then the timing of the fault would
 	// give this away).
 	case OSELECT:
-		t := marktemp(order)
+		t := o.markTemp()
 
-		var tmp1 *Node
-		var tmp2 *Node
-		var r *Node
-		for l := n.List; l != nil; l = l.Next {
-			if l.N.Op != OXCASE {
-				Fatal("order select case %v", Oconv(int(l.N.Op), 0))
+		for _, n2 := range n.List.Slice() {
+			if n2.Op != OXCASE {
+				Fatalf("order select case %v", n2.Op)
 			}
-			r = l.N.Left
-			setlineno(l.N)
+			r := n2.Left
+			setlineno(n2)
 
 			// Append any new body prologue to ninit.
 			// The next loop will insert ninit into nbody.
-			if l.N.Ninit != nil {
-				Fatal("order select ninit")
+			if n2.Ninit.Len() != 0 {
+				Fatalf("order select ninit")
 			}
 			if r != nil {
 				switch r.Op {
 				default:
-					Yyerror("unknown op in select %v", Oconv(int(r.Op), 0))
 					Dump("select case", r)
+					Fatalf("unknown op in select %v", r.Op)
 
-					// If this is case x := <-ch or case x, y := <-ch, the case has
+				// If this is case x := <-ch or case x, y := <-ch, the case has
 				// the ODCL nodes to declare x and y. We want to delay that
 				// declaration (and possible allocation) until inside the case body.
 				// Delete the ODCL nodes here and recreate them inside the body below.
 				case OSELRECV, OSELRECV2:
-					if r.Colas {
-						t = r.Ninit
-						if t != nil && t.N.Op == ODCL && t.N.Left == r.Left {
-							t = t.Next
+					if r.Colas() {
+						i := 0
+						if r.Ninit.Len() != 0 && r.Ninit.First().Op == ODCL && r.Ninit.First().Left == r.Left {
+							i++
 						}
-						if t != nil && t.N.Op == ODCL && r.List != nil && t.N.Left == r.List.N {
-							t = t.Next
+						if i < r.Ninit.Len() && r.Ninit.Index(i).Op == ODCL && r.List.Len() != 0 && r.Ninit.Index(i).Left == r.List.First() {
+							i++
 						}
-						if t == nil {
-							r.Ninit = nil
+						if i >= r.Ninit.Len() {
+							r.Ninit.Set(nil)
 						}
 					}
 
-					if r.Ninit != nil {
-						Yyerror("ninit on select recv")
+					if r.Ninit.Len() != 0 {
 						dumplist("ninit", r.Ninit)
+						Fatalf("ninit on select recv")
 					}
 
 					// case x = <-c
@@ -811,10 +797,10 @@ func orderstmt(n *Node, order *Order) {
 					// r->left is x, r->ntest is ok, r->right is ORECV, r->right->left is c.
 					// r->left == N means 'case <-c'.
 					// c is always evaluated; x and ok are only evaluated when assigned.
-					orderexpr(&r.Right.Left, order, nil)
+					r.Right.Left = o.expr(r.Right.Left, nil)
 
 					if r.Right.Left.Op != ONAME {
-						r.Right.Left = ordercopyexpr(r.Right.Left, r.Right.Left.Type, order, 0)
+						r.Right.Left = o.copyExpr(r.Right.Left, r.Right.Left.Type, false)
 					}
 
 					// Introduce temporary for receive and move actual copy into case body.
@@ -830,85 +816,89 @@ func orderstmt(n *Node, order *Order) {
 						// use channel element type for temporary to avoid conversions,
 						// such as in case interfacevalue = <-intchan.
 						// the conversion happens in the OAS instead.
-						tmp1 = r.Left
+						tmp1 := r.Left
 
-						if r.Colas {
-							tmp2 = Nod(ODCL, tmp1, nil)
-							typecheck(&tmp2, Etop)
-							l.N.Ninit = list(l.N.Ninit, tmp2)
+						if r.Colas() {
+							tmp2 := nod(ODCL, tmp1, nil)
+							tmp2 = typecheck(tmp2, Etop)
+							n2.Ninit.Append(tmp2)
 						}
 
-						r.Left = ordertemp(r.Right.Left.Type.Type, order, haspointers(r.Right.Left.Type.Type))
-						tmp2 = Nod(OAS, tmp1, r.Left)
-						typecheck(&tmp2, Etop)
-						l.N.Ninit = list(l.N.Ninit, tmp2)
+						r.Left = o.newTemp(r.Right.Left.Type.Elem(), types.Haspointers(r.Right.Left.Type.Elem()))
+						tmp2 := nod(OAS, tmp1, r.Left)
+						tmp2 = typecheck(tmp2, Etop)
+						n2.Ninit.Append(tmp2)
 					}
 
-					if r.List != nil && isblank(r.List.N) {
-						r.List = nil
+					if r.List.Len() != 0 && isblank(r.List.First()) {
+						r.List.Set(nil)
 					}
-					if r.List != nil {
-						tmp1 = r.List.N
-						if r.Colas {
-							tmp2 = Nod(ODCL, tmp1, nil)
-							typecheck(&tmp2, Etop)
-							l.N.Ninit = list(l.N.Ninit, tmp2)
+					if r.List.Len() != 0 {
+						tmp1 := r.List.First()
+						if r.Colas() {
+							tmp2 := nod(ODCL, tmp1, nil)
+							tmp2 = typecheck(tmp2, Etop)
+							n2.Ninit.Append(tmp2)
 						}
 
-						r.List = list1(ordertemp(tmp1.Type, order, false))
-						tmp2 = Nod(OAS, tmp1, r.List.N)
-						typecheck(&tmp2, Etop)
-						l.N.Ninit = list(l.N.Ninit, tmp2)
+						r.List.Set1(o.newTemp(types.Types[TBOOL], false))
+						tmp2 := okas(tmp1, r.List.First())
+						tmp2 = typecheck(tmp2, Etop)
+						n2.Ninit.Append(tmp2)
 					}
-
-					orderblock(&l.N.Ninit)
+					orderBlock(&n2.Ninit)
 
 				case OSEND:
-					if r.Ninit != nil {
-						Yyerror("ninit on select send")
+					if r.Ninit.Len() != 0 {
 						dumplist("ninit", r.Ninit)
+						Fatalf("ninit on select send")
 					}
 
 					// case c <- x
 					// r->left is c, r->right is x, both are always evaluated.
-					orderexpr(&r.Left, order, nil)
+					r.Left = o.expr(r.Left, nil)
 
-					if !istemp(r.Left) {
-						r.Left = ordercopyexpr(r.Left, r.Left.Type, order, 0)
+					if !r.Left.IsAutoTmp() {
+						r.Left = o.copyExpr(r.Left, r.Left.Type, false)
 					}
-					orderexpr(&r.Right, order, nil)
-					if !istemp(r.Right) {
-						r.Right = ordercopyexpr(r.Right, r.Right.Type, order, 0)
+					r.Right = o.expr(r.Right, nil)
+					if !r.Right.IsAutoTmp() {
+						r.Right = o.copyExpr(r.Right, r.Right.Type, false)
 					}
 				}
 			}
 
-			orderblock(&l.N.Nbody)
+			orderBlock(&n2.Nbody)
 		}
-
 		// Now that we have accumulated all the temporaries, clean them.
 		// Also insert any ninit queued during the previous loop.
 		// (The temporary cleaning must follow that ninit work.)
-		for l := n.List; l != nil; l = l.Next {
-			cleantempnopop(t, order, &l.N.Ninit)
-			l.N.Nbody = concat(l.N.Ninit, l.N.Nbody)
-			l.N.Ninit = nil
+		for _, n3 := range n.List.Slice() {
+			s := n3.Ninit.Slice()
+			o.cleanTempNoPop(t, &s)
+			n3.Nbody.Prepend(s...)
+			n3.Ninit.Set(nil)
 		}
 
-		order.out = list(order.out, n)
-		poptemp(t, order)
+		o.out = append(o.out, n)
+		o.popTemp(t)
 
-		// Special: value being sent is passed as a pointer; make it addressable.
+	// Special: value being sent is passed as a pointer; make it addressable.
 	case OSEND:
-		t := marktemp(order)
+		t := o.markTemp()
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
+		if instrumenting {
+			// Force copying to the stack so that (chan T)(nil) <- x
+			// is still instrumented as a read of x.
+			n.Right = o.copyExpr(n.Right, n.Right.Type, false)
+		} else {
+			n.Right = o.addrTemp(n.Right)
+		}
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right, order, nil)
-		orderaddrtemp(&n.Right, order)
-		order.out = list(order.out, n)
-		cleantemp(t, order)
-
-		// TODO(rsc): Clean temporaries more aggressively.
+	// TODO(rsc): Clean temporaries more aggressively.
 	// Note that because walkswitch will rewrite some of the
 	// switch into a binary search, this is not as easy as it looks.
 	// (If we ran that code here we could invoke orderstmt on
@@ -916,74 +906,74 @@ func orderstmt(n *Node, order *Order) {
 	// For now just clean all the temporaries at the end.
 	// In practice that's fine.
 	case OSWITCH:
-		t := marktemp(order)
-
-		orderexpr(&n.Left, order, nil)
-		for l := n.List; l != nil; l = l.Next {
-			if l.N.Op != OXCASE {
-				Fatal("order switch case %v", Oconv(int(l.N.Op), 0))
+		t := o.markTemp()
+		n.Left = o.expr(n.Left, nil)
+		for _, ncas := range n.List.Slice() {
+			if ncas.Op != OXCASE {
+				Fatalf("order switch case %v", ncas.Op)
 			}
-			orderexprlistinplace(l.N.List, order)
-			orderblock(&l.N.Nbody)
+			o.exprListInPlace(ncas.List)
+			orderBlock(&ncas.Nbody)
 		}
 
-		order.out = list(order.out, n)
-		cleantemp(t, order)
+		o.out = append(o.out, n)
+		o.cleanTemp(t)
 	}
 
-	lineno = int32(lno)
+	lineno = lno
 }
 
-// Orderexprlist orders the expression list l into order.
-func orderexprlist(l *NodeList, order *Order) {
-	for ; l != nil; l = l.Next {
-		orderexpr(&l.N, order, nil)
+// exprList orders the expression list l into o.
+func (o *Order) exprList(l Nodes) {
+	s := l.Slice()
+	for i := range s {
+		s[i] = o.expr(s[i], nil)
 	}
 }
 
-// Orderexprlist orders the expression list l but saves
+// exprListInPlace orders the expression list l but saves
 // the side effects on the individual expression ninit lists.
-func orderexprlistinplace(l *NodeList, order *Order) {
-	for ; l != nil; l = l.Next {
-		orderexprinplace(&l.N, order)
+func (o *Order) exprListInPlace(l Nodes) {
+	s := l.Slice()
+	for i := range s {
+		s[i] = o.exprInPlace(s[i])
 	}
 }
 
 // prealloc[x] records the allocation to use for x.
 var prealloc = map[*Node]*Node{}
 
-// Orderexpr orders a single expression, appending side
-// effects to order->out as needed.
+// expr orders a single expression, appending side
+// effects to o.out as needed.
 // If this is part of an assignment lhs = *np, lhs is given.
 // Otherwise lhs == nil. (When lhs != nil it may be possible
 // to avoid copying the result of the expression to a temporary.)
-func orderexpr(np **Node, order *Order, lhs *Node) {
-	n := *np
+// The result of expr MUST be assigned back to n, e.g.
+// 	n.Left = o.expr(n.Left, lhs)
+func (o *Order) expr(n, lhs *Node) *Node {
 	if n == nil {
-		return
+		return n
 	}
 
-	lno := int(setlineno(n))
-	orderinit(n, order)
+	lno := setlineno(n)
+	o.init(n)
 
 	switch n.Op {
 	default:
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right, order, nil)
-		orderexprlist(n.List, order)
-		orderexprlist(n.Rlist, order)
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
+		o.exprList(n.List)
+		o.exprList(n.Rlist)
 
-		// Addition of strings turns into a function call.
+	// Addition of strings turns into a function call.
 	// Allocate a temporary to hold the strings.
 	// Fewer than 5 strings use direct runtime helpers.
 	case OADDSTR:
-		orderexprlist(n.List, order)
+		o.exprList(n.List)
 
-		if count(n.List) > 5 {
-			t := typ(TARRAY)
-			t.Bound = int64(count(n.List))
-			t.Type = Types[TSTRING]
-			prealloc[n] = ordertemp(t, order, false)
+		if n.List.Len() > 5 {
+			t := types.NewArray(types.Types[TSTRING], int64(n.List.Len()))
+			prealloc[n] = o.newTemp(t, false)
 		}
 
 		// Mark string(byteSlice) arguments to reuse byteSlice backing
@@ -996,22 +986,22 @@ func orderexpr(np **Node, order *Order, lhs *Node) {
 		hasbyte := false
 
 		haslit := false
-		for l := n.List; l != nil; l = l.Next {
-			hasbyte = hasbyte || l.N.Op == OARRAYBYTESTR
-			haslit = haslit || l.N.Op == OLITERAL && len(l.N.Val().U.(string)) != 0
+		for _, n1 := range n.List.Slice() {
+			hasbyte = hasbyte || n1.Op == OARRAYBYTESTR
+			haslit = haslit || n1.Op == OLITERAL && len(n1.Val().U.(string)) != 0
 		}
 
 		if haslit && hasbyte {
-			for l := n.List; l != nil; l = l.Next {
-				if l.N.Op == OARRAYBYTESTR {
-					l.N.Op = OARRAYBYTESTRTMP
+			for _, n2 := range n.List.Slice() {
+				if n2.Op == OARRAYBYTESTR {
+					n2.Op = OARRAYBYTESTRTMP
 				}
 			}
 		}
 
 	case OCMPSTR:
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right, order, nil)
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
 
 		// Mark string(byteSlice) arguments to reuse byteSlice backing
 		// buffer during conversion. String comparison does not
@@ -1025,9 +1015,15 @@ func orderexpr(np **Node, order *Order, lhs *Node) {
 
 		// key must be addressable
 	case OINDEXMAP:
-		orderexpr(&n.Left, order, nil)
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
+		needCopy := false
 
-		orderexpr(&n.Right, order, nil)
+		if !n.IndexMapLValue() && instrumenting {
+			// Race detector needs the copy so it can
+			// call treecopy on the result.
+			needCopy = true
+		}
 
 		// For x = m[string(k)] where k is []byte, the allocation of
 		// backing bytes for the string can be avoided by reusing
@@ -1039,38 +1035,51 @@ func orderexpr(np **Node, order *Order, lhs *Node) {
 		// the map index, because the map access is going to
 		// be forced to happen immediately following this
 		// conversion (by the ordercopyexpr a few lines below).
-		if n.Etype == 0 && n.Right.Op == OARRAYBYTESTR {
+		if !n.IndexMapLValue() && n.Right.Op == OARRAYBYTESTR {
 			n.Right.Op = OARRAYBYTESTRTMP
+			needCopy = true
 		}
 
-		orderaddrtemp(&n.Right, order)
-		if n.Etype == 0 {
-			// use of value (not being assigned);
-			// make copy in temporary.
-			n = ordercopyexpr(n, n.Type, order, 0)
+		n.Right = o.mapKeyTemp(n.Left.Type, n.Right)
+		if needCopy {
+			n = o.copyExpr(n, n.Type, false)
 		}
 
-		// concrete type (not interface) argument must be addressable
+	// concrete type (not interface) argument must be addressable
 	// temporary to pass to runtime.
 	case OCONVIFACE:
-		orderexpr(&n.Left, order, nil)
+		n.Left = o.expr(n.Left, nil)
 
-		if !Isinter(n.Left.Type) {
-			orderaddrtemp(&n.Left, order)
+		if !n.Left.Type.IsInterface() {
+			n.Left = o.addrTemp(n.Left)
+		}
+
+	case OCONVNOP:
+		if n.Type.IsKind(TUNSAFEPTR) && n.Left.Type.IsKind(TUINTPTR) && (n.Left.Op == OCALLFUNC || n.Left.Op == OCALLINTER || n.Left.Op == OCALLMETH) {
+			// When reordering unsafe.Pointer(f()) into a separate
+			// statement, the conversion and function call must stay
+			// together. See golang.org/issue/15329.
+			o.init(n.Left)
+			o.call(n.Left)
+			if lhs == nil || lhs.Op != ONAME || instrumenting {
+				n = o.copyExpr(n, n.Type, false)
+			}
+		} else {
+			n.Left = o.expr(n.Left, nil)
 		}
 
 	case OANDAND, OOROR:
-		mark := marktemp(order)
-		orderexpr(&n.Left, order, nil)
+		mark := o.markTemp()
+		n.Left = o.expr(n.Left, nil)
 
 		// Clean temporaries from first branch at beginning of second.
 		// Leave them on the stack so that they can be killed in the outer
 		// context in case the short circuit is taken.
-		var l *NodeList
+		var s []*Node
 
-		cleantempnopop(mark, order, &l)
-		n.Right.Ninit = concat(l, n.Right.Ninit)
-		orderexprinplace(&n.Right, order)
+		o.cleanTempNoPop(mark, &s)
+		n.Right = addinit(n.Right, s)
+		n.Right = o.exprInPlace(n.Right)
 
 	case OCALLFUNC,
 		OCALLINTER,
@@ -1085,89 +1094,157 @@ func orderexpr(np **Node, order *Order, lhs *Node) {
 		OMAKESLICE,
 		ONEW,
 		OREAL,
-		ORECOVER:
-		ordercall(n, order)
-		if lhs == nil || lhs.Op != ONAME || flag_race != 0 {
-			n = ordercopyexpr(n, n.Type, order, 0)
+		ORECOVER,
+		OSTRARRAYBYTE,
+		OSTRARRAYBYTETMP,
+		OSTRARRAYRUNE:
+		o.call(n)
+		if lhs == nil || lhs.Op != ONAME || instrumenting {
+			n = o.copyExpr(n, n.Type, false)
 		}
 
 	case OAPPEND:
-		ordercallargs(&n.List, order)
-		if lhs == nil || lhs.Op != ONAME && !samesafeexpr(lhs, n.List.N) {
-			n = ordercopyexpr(n, n.Type, order, 0)
+		o.callArgs(&n.List)
+		if lhs == nil || lhs.Op != ONAME && !samesafeexpr(lhs, n.List.First()) {
+			n = o.copyExpr(n, n.Type, false)
 		}
 
-	case OSLICE, OSLICEARR, OSLICESTR:
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right.Left, order, nil)
-		n.Right.Left = ordercheapexpr(n.Right.Left, order)
-		orderexpr(&n.Right.Right, order, nil)
-		n.Right.Right = ordercheapexpr(n.Right.Right, order)
+	case OSLICE, OSLICEARR, OSLICESTR, OSLICE3, OSLICE3ARR:
+		n.Left = o.expr(n.Left, nil)
+		low, high, max := n.SliceBounds()
+		low = o.expr(low, nil)
+		low = o.cheapExpr(low)
+		high = o.expr(high, nil)
+		high = o.cheapExpr(high)
+		max = o.expr(max, nil)
+		max = o.cheapExpr(max)
+		n.SetSliceBounds(low, high, max)
 		if lhs == nil || lhs.Op != ONAME && !samesafeexpr(lhs, n.Left) {
-			n = ordercopyexpr(n, n.Type, order, 0)
-		}
-
-	case OSLICE3, OSLICE3ARR:
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right.Left, order, nil)
-		n.Right.Left = ordercheapexpr(n.Right.Left, order)
-		orderexpr(&n.Right.Right.Left, order, nil)
-		n.Right.Right.Left = ordercheapexpr(n.Right.Right.Left, order)
-		orderexpr(&n.Right.Right.Right, order, nil)
-		n.Right.Right.Right = ordercheapexpr(n.Right.Right.Right, order)
-		if lhs == nil || lhs.Op != ONAME && !samesafeexpr(lhs, n.Left) {
-			n = ordercopyexpr(n, n.Type, order, 0)
+			n = o.copyExpr(n, n.Type, false)
 		}
 
 	case OCLOSURE:
-		if n.Noescape && n.Func.Cvars != nil {
-			prealloc[n] = ordertemp(Types[TUINT8], order, false) // walk will fill in correct type
+		if n.Noescape() && n.Func.Cvars.Len() > 0 {
+			prealloc[n] = o.newTemp(types.Types[TUINT8], false) // walk will fill in correct type
 		}
 
-	case OARRAYLIT, OCALLPART:
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right, order, nil)
-		orderexprlist(n.List, order)
-		orderexprlist(n.Rlist, order)
-		if n.Noescape {
-			prealloc[n] = ordertemp(Types[TUINT8], order, false) // walk will fill in correct type
+	case OARRAYLIT, OSLICELIT, OCALLPART:
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
+		o.exprList(n.List)
+		o.exprList(n.Rlist)
+		if n.Noescape() {
+			prealloc[n] = o.newTemp(types.Types[TUINT8], false) // walk will fill in correct type
 		}
 
 	case ODDDARG:
-		if n.Noescape {
+		if n.Noescape() {
 			// The ddd argument does not live beyond the call it is created for.
 			// Allocate a temporary that will be cleaned up when this statement
 			// completes. We could be more aggressive and try to arrange for it
 			// to be cleaned up when the call completes.
-			prealloc[n] = ordertemp(n.Type.Type, order, false)
+			prealloc[n] = o.newTemp(n.Type.Elem(), false)
 		}
 
 	case ODOTTYPE, ODOTTYPE2:
-		orderexpr(&n.Left, order, nil)
-		// TODO(rsc): The Isfat is for consistency with componentgen and walkexpr.
+		n.Left = o.expr(n.Left, nil)
+		// TODO(rsc): The isfat is for consistency with componentgen and walkexpr.
 		// It needs to be removed in all three places.
 		// That would allow inlining x.(struct{*int}) the same as x.(*int).
-		if !isdirectiface(n.Type) || Isfat(n.Type) || flag_race != 0 {
-			n = ordercopyexpr(n, n.Type, order, 1)
+		if !isdirectiface(n.Type) || isfat(n.Type) || instrumenting {
+			n = o.copyExpr(n, n.Type, true)
 		}
 
 	case ORECV:
-		orderexpr(&n.Left, order, nil)
-		n = ordercopyexpr(n, n.Type, order, 1)
+		n.Left = o.expr(n.Left, nil)
+		n = o.copyExpr(n, n.Type, true)
 
 	case OEQ, ONE:
-		orderexpr(&n.Left, order, nil)
-		orderexpr(&n.Right, order, nil)
+		n.Left = o.expr(n.Left, nil)
+		n.Right = o.expr(n.Right, nil)
 		t := n.Left.Type
-		if t.Etype == TSTRUCT || Isfixedarray(t) {
+		if t.IsStruct() || t.IsArray() {
 			// for complex comparisons, we need both args to be
 			// addressable so we can pass them to the runtime.
-			orderaddrtemp(&n.Left, order)
-			orderaddrtemp(&n.Right, order)
+			n.Left = o.addrTemp(n.Left)
+			n.Right = o.addrTemp(n.Right)
 		}
 	}
 
-	lineno = int32(lno)
+	lineno = lno
+	return n
+}
 
-	*np = n
+// okas creates and returns an assignment of val to ok,
+// including an explicit conversion if necessary.
+func okas(ok, val *Node) *Node {
+	if !isblank(ok) {
+		val = conv(val, ok.Type)
+	}
+	return nod(OAS, ok, val)
+}
+
+// as2 orders OAS2XXXX nodes. It creates temporaries to ensure left-to-right assignment.
+// The caller should order the right-hand side of the assignment before calling orderas2.
+// It rewrites,
+// 	a, b, a = ...
+// as
+//	tmp1, tmp2, tmp3 = ...
+// 	a, b, a = tmp1, tmp2, tmp3
+// This is necessary to ensure left to right assignment order.
+func (o *Order) as2(n *Node) {
+	tmplist := []*Node{}
+	left := []*Node{}
+	for _, l := range n.List.Slice() {
+		if !isblank(l) {
+			tmp := o.newTemp(l.Type, types.Haspointers(l.Type))
+			tmplist = append(tmplist, tmp)
+			left = append(left, l)
+		}
+	}
+
+	o.out = append(o.out, n)
+
+	as := nod(OAS2, nil, nil)
+	as.List.Set(left)
+	as.Rlist.Set(tmplist)
+	as = typecheck(as, Etop)
+	o.stmt(as)
+
+	ti := 0
+	for ni, l := range n.List.Slice() {
+		if !isblank(l) {
+			n.List.SetIndex(ni, tmplist[ti])
+			ti++
+		}
+	}
+}
+
+// okAs2 orders OAS2 with ok.
+// Just like as2, this also adds temporaries to ensure left-to-right assignment.
+func (o *Order) okAs2(n *Node) {
+	var tmp1, tmp2 *Node
+	if !isblank(n.List.First()) {
+		typ := n.Rlist.First().Type
+		tmp1 = o.newTemp(typ, types.Haspointers(typ))
+	}
+
+	if !isblank(n.List.Second()) {
+		tmp2 = o.newTemp(types.Types[TBOOL], false)
+	}
+
+	o.out = append(o.out, n)
+
+	if tmp1 != nil {
+		r := nod(OAS, n.List.First(), tmp1)
+		r = typecheck(r, Etop)
+		o.mapAssign(r)
+		n.List.SetFirst(tmp1)
+	}
+	if tmp2 != nil {
+		r := okas(n.List.Second(), tmp2)
+		r = typecheck(r, Etop)
+		o.mapAssign(r)
+		n.List.SetSecond(tmp2)
+	}
 }

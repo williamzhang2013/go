@@ -14,10 +14,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 func main() {
-	test(" ") // old deprecated syntax
+	// test(" ") // old deprecated & removed syntax
 	test("=") // new syntax
 }
 
@@ -47,6 +48,23 @@ func test(sep string) {
 	_, err = cmd.CombinedOutput()
 	if err == nil {
 		fmt.Println("-X linker flag should not accept keys without values")
+		os.Exit(1)
+	}
+
+	// Issue 9621
+	cmd = exec.Command("go", "run", "-ldflags=-X main.b=false -X main.x=42", "linkx.go")
+	outx, err := cmd.CombinedOutput()
+	if err == nil {
+		fmt.Println("-X linker flag should not overwrite non-strings")
+		os.Exit(1)
+	}
+	outstr := string(outx)
+	if !strings.Contains(outstr, "main.b") {
+		fmt.Printf("-X linker flag did not diagnose overwrite of main.b:\n%s\n", outstr)
+		os.Exit(1)
+	}
+	if !strings.Contains(outstr, "main.x") {
+		fmt.Printf("-X linker flag did not diagnose overwrite of main.x:\n%s\n", outstr)
 		os.Exit(1)
 	}
 }

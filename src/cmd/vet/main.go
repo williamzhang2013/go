@@ -8,14 +8,17 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/build"
+	"go/importer"
 	"go/parser"
 	"go/printer"
 	"go/token"
 	"go/types"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -23,18 +26,22 @@ import (
 	"strings"
 )
 
+// Important! If you add flags here, make sure to update cmd/go/internal/vet/vetflag.go.
+
 var (
-	verbose  = flag.Bool("v", false, "verbose")
-	testFlag = flag.Bool("test", false, "for testing only: sets -all and -shadow")
-	tags     = flag.String("tags", "", "comma-separated list of build tags to apply when parsing")
-	tagList  = []string{} // exploded version of tags flag; set in main
+	verbose = flag.Bool("v", false, "verbose")
+	source  = flag.Bool("source", false, "import from source instead of compiled object files")
+	tags    = flag.String("tags", "", "space-separated list of build tags to apply when parsing")
+	tagList = []string{} // exploded version of tags flag; set in main
+
+	vcfg          vetConfig
+	mustTypecheck bool
 )
 
 var exitCode = 0
 
-// "all" is here only for the appearance of backwards compatibility.
-// It has no effect; the triState flags do the work.
-var all = flag.Bool("all", true, "check everything; disabled if any explicit check is requested")
+// "-all" flag enables all non-experimental checks
+var all = triStateFlag("all", unset, "enable all non-experimental checks")
 
 // Flags to control which individual checks to perform.
 var report = map[string]*triState{
@@ -50,6 +57,14 @@ var experimental = map[string]bool{}
 
 // setTrueCount record how many flags are explicitly set to true.
 var setTrueCount int
+
+// dirsRun and filesRun indicate whether the vet is applied to directory or
+// file targets. The distinction affects which checks are run.
+var dirsRun, filesRun bool
+
+// includesNonTest indicates whether the vet is applied to non-test targets.
+// Certain checks are relevant only if they touch both test and non-test files.
+var includesNonTest bool
 
 // A triState is a boolean that knows whether it has been set to either true or false.
 // It is used to identify if a flag appears; the standard boolean flag cannot
@@ -94,7 +109,7 @@ func (ts *triState) Set(value string) error {
 func (ts *triState) String() string {
 	switch *ts {
 	case unset:
-		return "unset"
+		return "true" // An unset flag will be set by -all, so defaults to true.
 	case setTrue:
 		return "true"
 	case setFalse:
@@ -109,13 +124,10 @@ func (ts triState) IsBoolFlag() bool {
 
 // vet tells whether to report errors for the named check, a flag name.
 func vet(name string) bool {
-	if *testFlag {
-		return true
-	}
 	return report[name].isTrue()
 }
 
-// setExit sets the value for os.Exit when it is called, later.  It
+// setExit sets the value for os.Exit when it is called, later. It
 // remembers the highest value.
 func setExit(err int) {
 	if err > exitCode {
@@ -130,12 +142,14 @@ var (
 	callExpr      *ast.CallExpr
 	compositeLit  *ast.CompositeLit
 	exprStmt      *ast.ExprStmt
-	field         *ast.Field
+	forStmt       *ast.ForStmt
 	funcDecl      *ast.FuncDecl
 	funcLit       *ast.FuncLit
 	genDecl       *ast.GenDecl
 	interfaceType *ast.InterfaceType
 	rangeStmt     *ast.RangeStmt
+	returnStmt    *ast.ReturnStmt
+	structType    *ast.StructType
 
 	// checkers is a two-level map.
 	// The outer level is keyed by a nil pointer, one of the AST vars above.
@@ -157,11 +171,12 @@ func register(name, usage string, fn func(*File, ast.Node), types ...ast.Node) {
 
 // Usage is a replacement usage function for the flags package.
 func Usage() {
-	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage of vet:\n")
 	fmt.Fprintf(os.Stderr, "\tvet [flags] directory...\n")
 	fmt.Fprintf(os.Stderr, "\tvet [flags] files... # Must be a single package\n")
+	fmt.Fprintf(os.Stderr, "By default, -all is set and all non-experimental checks are run.\n")
 	fmt.Fprintf(os.Stderr, "For more information run\n")
-	fmt.Fprintf(os.Stderr, "\tgodoc golang.org/x/tools/cmd/vet\n\n")
+	fmt.Fprintf(os.Stderr, "\tgo doc cmd/vet\n\n")
 	fmt.Fprintf(os.Stderr, "Flags:\n")
 	flag.PrintDefaults()
 	os.Exit(2)
@@ -177,12 +192,20 @@ type File struct {
 	file    *ast.File
 	b       bytes.Buffer // for use by methods
 
-	// The objects that are receivers of a "String() string" method.
+	// Parsed package "foo" when checking package "foo_test"
+	basePkg *Package
+
+	// The keys are the objects that are receivers of a "String()
+	// string" method. The value reports whether the method has a
+	// pointer receiver.
 	// This is used by the recursiveStringer method in print.go.
-	stringers map[*ast.Object]bool
+	stringerPtrs map[*ast.Object]bool
 
 	// Registered checkers to run.
 	checkers map[ast.Node][]func(*File, ast.Node)
+
+	// Unreachable nodes; can be ignored in shift check.
+	dead map[ast.Node]bool
 }
 
 func main() {
@@ -190,8 +213,9 @@ func main() {
 	flag.Parse()
 
 	// If any flag is set, we run only those checks requested.
-	// If no flags are set true, set all the non-experimental ones not explicitly set (in effect, set the "-all" flag).
-	if setTrueCount == 0 {
+	// If all flag is set true or if no flags are set true, set all the non-experimental ones
+	// not explicitly set (in effect, set the "-all" flag).
+	if setTrueCount == 0 || *all == setTrue {
 		for name, setting := range report {
 			if *setting == unset && !experimental[name] {
 				*setting = setTrue
@@ -199,7 +223,10 @@ func main() {
 		}
 	}
 
-	tagList = strings.Split(*tags, ",")
+	// Accept space-separated tags because that matches
+	// the go command's other subcommands.
+	// Accept commas because go tool vet traditionally has.
+	tagList = strings.Fields(strings.Replace(*tags, ",", " ", -1))
 
 	initPrintFlags()
 	initUnusedFlags()
@@ -207,8 +234,18 @@ func main() {
 	if flag.NArg() == 0 {
 		Usage()
 	}
-	dirs := false
-	files := false
+
+	// Special case for "go vet" passing an explicit configuration:
+	// single argument ending in vet.cfg.
+	// Once we have a more general mechanism for obtaining this
+	// information from build tools like the go command,
+	// vet should be changed to use it. This vet.cfg hack is an
+	// experiment to learn about what form that information should take.
+	if flag.NArg() == 1 && strings.HasSuffix(flag.Arg(0), "vet.cfg") {
+		doPackageCfg(flag.Arg(0))
+		os.Exit(exitCode)
+	}
+
 	for _, name := range flag.Args() {
 		// Is it a directory?
 		fi, err := os.Stat(name)
@@ -217,21 +254,24 @@ func main() {
 			continue
 		}
 		if fi.IsDir() {
-			dirs = true
+			dirsRun = true
 		} else {
-			files = true
+			filesRun = true
+			if !strings.HasSuffix(name, "_test.go") {
+				includesNonTest = true
+			}
 		}
 	}
-	if dirs && files {
+	if dirsRun && filesRun {
 		Usage()
 	}
-	if dirs {
+	if dirsRun {
 		for _, name := range flag.Args() {
 			walkDir(name)
 		}
 		os.Exit(exitCode)
 	}
-	if !doPackage(".", flag.Args()) {
+	if doPackage(flag.Args(), nil) == nil {
 		warnf("no files checked")
 	}
 	os.Exit(exitCode)
@@ -244,6 +284,67 @@ func prefixDirectory(directory string, names []string) {
 			names[i] = filepath.Join(directory, name)
 		}
 	}
+}
+
+// vetConfig is the JSON config struct prepared by the Go command.
+type vetConfig struct {
+	Compiler    string
+	Dir         string
+	ImportPath  string
+	GoFiles     []string
+	ImportMap   map[string]string
+	PackageFile map[string]string
+
+	SucceedOnTypecheckFailure bool
+
+	imp types.Importer
+}
+
+func (v *vetConfig) Import(path string) (*types.Package, error) {
+	if v.imp == nil {
+		v.imp = importer.For(v.Compiler, v.openPackageFile)
+	}
+	if path == "unsafe" {
+		return v.imp.Import("unsafe")
+	}
+	p := v.ImportMap[path]
+	if p == "" {
+		return nil, fmt.Errorf("unknown import path %q", path)
+	}
+	if v.PackageFile[p] == "" {
+		return nil, fmt.Errorf("unknown package file for import %q", path)
+	}
+	return v.imp.Import(p)
+}
+
+func (v *vetConfig) openPackageFile(path string) (io.ReadCloser, error) {
+	file := v.PackageFile[path]
+	if file == "" {
+		// Note that path here has been translated via v.ImportMap,
+		// unlike in the error in Import above. We prefer the error in
+		// Import, but it's worth diagnosing this one too, just in case.
+		return nil, fmt.Errorf("unknown package file for %q", path)
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// doPackageCfg analyzes a single package described in a config file.
+func doPackageCfg(cfgFile string) {
+	js, err := ioutil.ReadFile(cfgFile)
+	if err != nil {
+		errorf("%v", err)
+	}
+	if err := json.Unmarshal(js, &vcfg); err != nil {
+		errorf("parsing vet config %s: %v", cfgFile, err)
+	}
+	stdImporter = &vcfg
+	inittypes()
+	mustTypecheck = true
+	doPackage(vcfg.GoFiles, nil)
 }
 
 // doPackageDir analyzes the single package found in the directory, if there is one,
@@ -271,12 +372,12 @@ func doPackageDir(directory string) {
 	names = append(names, pkg.TestGoFiles...) // These are also in the "foo" package.
 	names = append(names, pkg.SFiles...)
 	prefixDirectory(directory, names)
-	doPackage(directory, names)
+	basePkg := doPackage(names, nil)
 	// Is there also a "foo_test" package? If so, do that one as well.
 	if len(pkg.XTestGoFiles) > 0 {
 		names = pkg.XTestGoFiles
 		prefixDirectory(directory, names)
-		doPackage(directory, names)
+		doPackage(names, basePkg)
 	}
 }
 
@@ -292,8 +393,8 @@ type Package struct {
 }
 
 // doPackage analyzes the single package constructed from the named files.
-// It returns whether any files were checked.
-func doPackage(directory string, names []string) bool {
+// It returns the parsed Package or nil if none of the files have been checked.
+func doPackage(names []string, basePkg *Package) *Package {
 	var files []*File
 	var astFiles []*ast.File
 	fs := token.NewFileSet()
@@ -302,7 +403,7 @@ func doPackage(directory string, names []string) bool {
 		if err != nil {
 			// Warn but continue to next package.
 			warnf("%s: %s", name, err)
-			return false
+			return nil
 		}
 		checkBuildTag(name, data)
 		var parsedFile *ast.File
@@ -310,22 +411,42 @@ func doPackage(directory string, names []string) bool {
 			parsedFile, err = parser.ParseFile(fs, name, data, 0)
 			if err != nil {
 				warnf("%s: %s", name, err)
-				return false
+				return nil
 			}
 			astFiles = append(astFiles, parsedFile)
 		}
-		files = append(files, &File{fset: fs, content: data, name: name, file: parsedFile})
+		files = append(files, &File{
+			fset:    fs,
+			content: data,
+			name:    name,
+			file:    parsedFile,
+			dead:    make(map[ast.Node]bool),
+		})
 	}
 	if len(astFiles) == 0 {
-		return false
+		return nil
 	}
 	pkg := new(Package)
 	pkg.path = astFiles[0].Name.Name
 	pkg.files = files
 	// Type check the package.
-	err := pkg.check(fs, astFiles)
-	if err != nil && *verbose {
-		warnf("%s", err)
+	errs := pkg.check(fs, astFiles)
+	if errs != nil {
+		if vcfg.SucceedOnTypecheckFailure {
+			os.Exit(0)
+		}
+		if *verbose || mustTypecheck {
+			for _, err := range errs {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+			}
+			if mustTypecheck {
+				// This message could be silenced, and we could just exit,
+				// but it might be helpful at least at first to make clear that the
+				// above errors are coming from vet and not the compiler
+				// (they often look like compiler errors, such as "declared but not used").
+				errorf("typecheck failures")
+			}
+		}
 	}
 
 	// Check.
@@ -339,13 +460,14 @@ func doPackage(directory string, names []string) bool {
 	}
 	for _, file := range files {
 		file.pkg = pkg
+		file.basePkg = basePkg
 		file.checkers = chk
 		if file.file != nil {
 			file.walkFile(file.name, file.file)
 		}
 	}
 	asmCheck(pkg)
-	return true
+	return pkg
 }
 
 func visit(path string, f os.FileInfo, err error) error {
@@ -426,17 +548,25 @@ func (f *File) loc(pos token.Pos) string {
 	// expression instead of the inner part with the actual error, the
 	// precision can mislead.
 	posn := f.fset.Position(pos)
-	return fmt.Sprintf("%s:%d: ", posn.Filename, posn.Line)
+	return fmt.Sprintf("%s:%d", posn.Filename, posn.Line)
+}
+
+// locPrefix returns a formatted representation of the position for use as a line prefix.
+func (f *File) locPrefix(pos token.Pos) string {
+	if pos == token.NoPos {
+		return ""
+	}
+	return fmt.Sprintf("%s: ", f.loc(pos))
 }
 
 // Warn reports an error but does not set the exit code.
 func (f *File) Warn(pos token.Pos, args ...interface{}) {
-	fmt.Fprint(os.Stderr, f.loc(pos)+fmt.Sprintln(args...))
+	fmt.Fprintf(os.Stderr, "%s%s", f.locPrefix(pos), fmt.Sprintln(args...))
 }
 
 // Warnf reports a formatted error but does not set the exit code.
 func (f *File) Warnf(pos token.Pos, format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, f.loc(pos)+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "%s%s\n", f.locPrefix(pos), fmt.Sprintf(format, args...))
 }
 
 // walkFile walks the file's tree.
@@ -447,6 +577,7 @@ func (f *File) walkFile(name string, file *ast.File) {
 
 // Visit implements the ast.Visitor interface.
 func (f *File) Visit(node ast.Node) ast.Visitor {
+	f.updateDead(node)
 	var key ast.Node
 	switch node.(type) {
 	case *ast.AssignStmt:
@@ -459,8 +590,8 @@ func (f *File) Visit(node ast.Node) ast.Visitor {
 		key = compositeLit
 	case *ast.ExprStmt:
 		key = exprStmt
-	case *ast.Field:
-		key = field
+	case *ast.ForStmt:
+		key = forStmt
 	case *ast.FuncDecl:
 		key = funcDecl
 	case *ast.FuncLit:
@@ -471,6 +602,10 @@ func (f *File) Visit(node ast.Node) ast.Visitor {
 		key = interfaceType
 	case *ast.RangeStmt:
 		key = rangeStmt
+	case *ast.ReturnStmt:
+		key = returnStmt
+	case *ast.StructType:
+		key = structType
 	}
 	for _, fn := range f.checkers[key] {
 		fn(f, node)

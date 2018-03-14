@@ -88,6 +88,17 @@ func TestOutput(t *testing.T) {
 	}
 }
 
+func TestOutputRace(t *testing.T) {
+	var b bytes.Buffer
+	l := New(&b, "", 0)
+	for i := 0; i < 100; i++ {
+		go func() {
+			l.SetFlags(0)
+		}()
+		l.Output(0, "")
+	}
+}
+
 func TestFlagAndPrefixSetting(t *testing.T) {
 	var b bytes.Buffer
 	l := New(&b, "Test:", LstdFlags)
@@ -136,9 +147,9 @@ func TestUTCFlag(t *testing.T) {
 	}
 	// It's possible we crossed a second boundary between getting now and logging,
 	// so add a second and try again. This should very nearly always work.
-	now.Add(time.Second)
+	now = now.Add(time.Second)
 	want = fmt.Sprintf("Test:%d/%.2d/%.2d %.2d:%.2d:%.2d hello\n",
-		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute())
+		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second())
 	if got == want {
 		return
 	}
@@ -177,6 +188,16 @@ func BenchmarkPrintln(b *testing.B) {
 	const testString = "test"
 	var buf bytes.Buffer
 	l := New(&buf, "", LstdFlags)
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		l.Println(testString)
+	}
+}
+
+func BenchmarkPrintlnNoFlags(b *testing.B) {
+	const testString = "test"
+	var buf bytes.Buffer
+	l := New(&buf, "", 0)
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
 		l.Println(testString)

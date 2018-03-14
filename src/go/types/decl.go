@@ -6,7 +6,7 @@ package types
 
 import (
 	"go/ast"
-	exact "go/constant" // Renamed to reduce diffs from x/tools.  TODO: remove
+	"go/constant"
 	"go/token"
 )
 
@@ -19,7 +19,7 @@ func (check *Checker) reportAltDecl(obj Object) {
 	}
 }
 
-func (check *Checker) declare(scope *Scope, id *ast.Ident, obj Object) {
+func (check *Checker) declare(scope *Scope, id *ast.Ident, obj Object, pos token.Pos) {
 	// spec: "The blank identifier, represented by the underscore
 	// character _, may be used in a declaration like any other
 	// identifier but the declaration does not introduce a new
@@ -30,10 +30,23 @@ func (check *Checker) declare(scope *Scope, id *ast.Ident, obj Object) {
 			check.reportAltDecl(alt)
 			return
 		}
+		obj.setScopePos(pos)
 	}
 	if id != nil {
 		check.recordDef(id, obj)
 	}
+}
+
+// pathString returns a string of the form a->b-> ... ->g for a path [a, b, ... g].
+func pathString(path []*TypeName) string {
+	var s string
+	for i, p := range path {
+		if i > 0 {
+			s += "->"
+		}
+		s += p.Name()
+	}
+	return s
 }
 
 // objDecl type-checks the declaration of obj in its respective (file) context.
@@ -44,7 +57,7 @@ func (check *Checker) objDecl(obj Object, def *Named, path []*TypeName) {
 	}
 
 	if trace {
-		check.trace(obj.Pos(), "-- declaring %s", obj.Name())
+		check.trace(obj.Pos(), "-- checking %s (path = %s)", obj, pathString(path))
 		check.indent++
 		defer func() {
 			check.indent--
@@ -54,7 +67,7 @@ func (check *Checker) objDecl(obj Object, def *Named, path []*TypeName) {
 
 	d := check.objMap[obj]
 	if d == nil {
-		check.dump("%s: %s should have been declared", obj.Pos(), obj.Name())
+		check.dump("%s: %s should have been declared", obj.Pos(), obj)
 		unreachable()
 	}
 
@@ -80,7 +93,7 @@ func (check *Checker) objDecl(obj Object, def *Named, path []*TypeName) {
 		check.varDecl(obj, d.lhs, d.typ, d.init)
 	case *TypeName:
 		// invalid recursive types are detected via path
-		check.typeDecl(obj, d.typ, def, path)
+		check.typeDecl(obj, d.typ, def, path, d.alias)
 	case *Func:
 		// functions may be recursive - no need to track dependencies
 		check.funcDecl(obj, d)
@@ -99,18 +112,21 @@ func (check *Checker) constDecl(obj *Const, typ, init ast.Expr) {
 	obj.visited = true
 
 	// use the correct value of iota
-	assert(check.iota == nil)
 	check.iota = obj.val
 	defer func() { check.iota = nil }()
 
 	// provide valid constant value under all circumstances
-	obj.val = exact.MakeUnknown()
+	obj.val = constant.MakeUnknown()
 
 	// determine type, if any
 	if typ != nil {
 		t := check.typ(typ)
 		if !isConstType(t) {
-			check.errorf(typ.Pos(), "invalid constant type %s", t)
+			// don't report an error if the type is an invalid C (defined) type
+			// (issue #22090)
+			if t.Underlying() != Typ[Invalid] {
+				check.errorf(typ.Pos(), "invalid constant type %s", t)
+			}
 			obj.typ = Typ[Invalid]
 			return
 		}
@@ -134,12 +150,17 @@ func (check *Checker) varDecl(obj *Var, lhs []*Var, typ, init ast.Expr) {
 	}
 	obj.visited = true
 
-	// var declarations cannot use iota
-	assert(check.iota == nil)
-
 	// determine type, if any
 	if typ != nil {
 		obj.typ = check.typ(typ)
+		// We cannot spread the type to all lhs variables if there
+		// are more than one since that would mark them as checked
+		// (see Checker.objDecl) and the assignment of init exprs,
+		// if any, would not be checked.
+		//
+		// TODO(gri) If we have no init expr, we should distribute
+		// a given type otherwise we need to re-evalate the type
+		// expr for each lhs variable, leading to duplicate work.
 	}
 
 	// check initialization
@@ -155,7 +176,7 @@ func (check *Checker) varDecl(obj *Var, lhs []*Var, typ, init ast.Expr) {
 		assert(lhs == nil || lhs[0] == obj)
 		var x operand
 		check.expr(&x, init)
-		check.initVar(obj, &x, false)
+		check.initVar(obj, &x, "variable declaration")
 		return
 	}
 
@@ -172,6 +193,17 @@ func (check *Checker) varDecl(obj *Var, lhs []*Var, typ, init ast.Expr) {
 			panic("inconsistent lhs")
 		}
 	}
+
+	// We have multiple variables on the lhs and one init expr.
+	// Make sure all variables have been given the same type if
+	// one was specified, otherwise they assume the type of the
+	// init expression values (was issue #15755).
+	if typ != nil {
+		for _, lhs := range lhs {
+			lhs.typ = obj.typ
+		}
+	}
+
 	check.initVars(lhs, []ast.Expr{init}, token.NoPos)
 }
 
@@ -195,93 +227,106 @@ func (n *Named) setUnderlying(typ Type) {
 	}
 }
 
-func (check *Checker) typeDecl(obj *TypeName, typ ast.Expr, def *Named, path []*TypeName) {
+func (check *Checker) typeDecl(obj *TypeName, typ ast.Expr, def *Named, path []*TypeName, alias bool) {
 	assert(obj.typ == nil)
 
-	// type declarations cannot use iota
-	assert(check.iota == nil)
+	if alias {
 
-	named := &Named{obj: obj}
-	def.setUnderlying(named)
-	obj.typ = named // make sure recursive type declarations terminate
+		obj.typ = Typ[Invalid]
+		obj.typ = check.typExpr(typ, nil, append(path, obj))
 
-	// determine underlying type of named
-	check.typExpr(typ, named, append(path, obj))
+	} else {
 
-	// The underlying type of named may be itself a named type that is
-	// incomplete:
-	//
-	//	type (
-	//		A B
-	//		B *C
-	//		C A
-	//	)
-	//
-	// The type of C is the (named) type of A which is incomplete,
-	// and which has as its underlying type the named type B.
-	// Determine the (final, unnamed) underlying type by resolving
-	// any forward chain (they always end in an unnamed type).
-	named.underlying = underlying(named.underlying)
+		named := &Named{obj: obj}
+		def.setUnderlying(named)
+		obj.typ = named // make sure recursive type declarations terminate
+
+		// determine underlying type of named
+		check.typExpr(typ, named, append(path, obj))
+
+		// The underlying type of named may be itself a named type that is
+		// incomplete:
+		//
+		//	type (
+		//		A B
+		//		B *C
+		//		C A
+		//	)
+		//
+		// The type of C is the (named) type of A which is incomplete,
+		// and which has as its underlying type the named type B.
+		// Determine the (final, unnamed) underlying type by resolving
+		// any forward chain (they always end in an unnamed type).
+		named.underlying = underlying(named.underlying)
+
+	}
 
 	// check and add associated methods
 	// TODO(gri) It's easy to create pathological cases where the
 	// current approach is incorrect: In general we need to know
 	// and add all methods _before_ type-checking the type.
-	// See http://play.golang.org/p/WMpE0q2wK8
+	// See https://play.golang.org/p/WMpE0q2wK8
 	check.addMethodDecls(obj)
 }
 
 func (check *Checker) addMethodDecls(obj *TypeName) {
 	// get associated methods
-	methods := check.methods[obj.name]
-	if len(methods) == 0 {
-		return // no methods
+	// (Checker.collectObjects only collects methods with non-blank names;
+	// Checker.resolveBaseTypeName ensures that obj is not an alias name
+	// if it has attached methods.)
+	methods := check.methods[obj]
+	if methods == nil {
+		return
 	}
-	delete(check.methods, obj.name)
+	delete(check.methods, obj)
+	assert(!obj.IsAlias())
 
 	// use an objset to check for name conflicts
 	var mset objset
 
 	// spec: "If the base type is a struct type, the non-blank method
 	// and field names must be distinct."
-	base := obj.typ.(*Named)
-	if t, _ := base.underlying.(*Struct); t != nil {
-		for _, fld := range t.fields {
-			if fld.name != "_" {
-				assert(mset.insert(fld) == nil)
+	base, _ := obj.typ.(*Named) // shouldn't fail but be conservative
+	if base != nil {
+		if t, _ := base.underlying.(*Struct); t != nil {
+			for _, fld := range t.fields {
+				if fld.name != "_" {
+					assert(mset.insert(fld) == nil)
+				}
 			}
 		}
-	}
 
-	// Checker.Files may be called multiple times; additional package files
-	// may add methods to already type-checked types. Add pre-existing methods
-	// so that we can detect redeclarations.
-	for _, m := range base.methods {
-		assert(m.name != "_")
-		assert(mset.insert(m) == nil)
+		// Checker.Files may be called multiple times; additional package files
+		// may add methods to already type-checked types. Add pre-existing methods
+		// so that we can detect redeclarations.
+		for _, m := range base.methods {
+			assert(m.name != "_")
+			assert(mset.insert(m) == nil)
+		}
 	}
 
 	// type-check methods
 	for _, m := range methods {
 		// spec: "For a base type, the non-blank names of methods bound
 		// to it must be unique."
-		if m.name != "_" {
-			if alt := mset.insert(m); alt != nil {
-				switch alt.(type) {
-				case *Var:
-					check.errorf(m.pos, "field and method with the same name %s", m.name)
-				case *Func:
-					check.errorf(m.pos, "method %s already declared for %s", m.name, base)
-				default:
-					unreachable()
-				}
-				check.reportAltDecl(alt)
-				continue
+		assert(m.name != "_")
+		if alt := mset.insert(m); alt != nil {
+			switch alt.(type) {
+			case *Var:
+				check.errorf(m.pos, "field and method with the same name %s", m.name)
+			case *Func:
+				check.errorf(m.pos, "method %s already declared for %s", m.name, obj)
+			default:
+				unreachable()
 			}
+			check.reportAltDecl(alt)
+			continue
 		}
+
+		// type-check
 		check.objDecl(m, nil, nil)
-		// methods with blank _ names cannot be found - don't keep them
-		if m.name != "_" {
+
+		if base != nil {
 			base.methods = append(base.methods, m)
 		}
 	}
@@ -305,7 +350,9 @@ func (check *Checker) funcDecl(obj *Func, decl *declInfo) {
 	// function body must be type-checked after global declarations
 	// (functions implemented elsewhere have no body)
 	if !check.conf.IgnoreFuncBodies && fdecl.Body != nil {
-		check.later(obj.name, decl, sig, fdecl.Body)
+		check.later(func() {
+			check.funcBody(decl, obj.name, sig, fdecl.Body, nil)
+		})
 	}
 }
 
@@ -323,6 +370,8 @@ func (check *Checker) declStmt(decl ast.Decl) {
 			case *ast.ValueSpec:
 				switch d.Tok {
 				case token.CONST:
+					top := len(check.delayed)
+
 					// determine which init exprs to use
 					switch {
 					case s.Type != nil || len(s.Values) > 0:
@@ -334,7 +383,7 @@ func (check *Checker) declStmt(decl ast.Decl) {
 					// declare all constants
 					lhs := make([]*Const, len(s.Names))
 					for i, name := range s.Names {
-						obj := NewConst(name.Pos(), pkg, name.Name, nil, exact.MakeInt64(int64(iota)))
+						obj := NewConst(name.Pos(), pkg, name.Name, nil, constant.MakeInt64(int64(iota)))
 						lhs[i] = obj
 
 						var init ast.Expr
@@ -347,11 +396,21 @@ func (check *Checker) declStmt(decl ast.Decl) {
 
 					check.arityMatch(s, last)
 
+					// process function literals in init expressions before scope changes
+					check.processDelayed(top)
+
+					// spec: "The scope of a constant or variable identifier declared
+					// inside a function begins at the end of the ConstSpec or VarSpec
+					// (ShortVarDecl for short variable declarations) and ends at the
+					// end of the innermost containing block."
+					scopePos := s.End()
 					for i, name := range s.Names {
-						check.declare(check.scope, name, lhs[i])
+						check.declare(check.scope, name, lhs[i], scopePos)
 					}
 
 				case token.VAR:
+					top := len(check.delayed)
+
 					lhs0 := make([]*Var, len(s.Names))
 					for i, name := range s.Names {
 						lhs0[i] = NewVar(name.Pos(), pkg, name.Name, nil)
@@ -392,10 +451,15 @@ func (check *Checker) declStmt(decl ast.Decl) {
 
 					check.arityMatch(s, nil)
 
+					// process function literals in init expressions before scope changes
+					check.processDelayed(top)
+
 					// declare all variables
 					// (only at this point are the variable scopes (parents) set)
+					scopePos := s.End() // see constant declarations
 					for i, name := range s.Names {
-						check.declare(check.scope, name, lhs0[i])
+						// see constant declarations
+						check.declare(check.scope, name, lhs0[i], scopePos)
 					}
 
 				default:
@@ -404,8 +468,12 @@ func (check *Checker) declStmt(decl ast.Decl) {
 
 			case *ast.TypeSpec:
 				obj := NewTypeName(s.Name.Pos(), pkg, s.Name.Name, nil)
-				check.declare(check.scope, s.Name, obj)
-				check.typeDecl(obj, s.Type, nil, nil)
+				// spec: "The scope of a type identifier declared inside a function
+				// begins at the identifier in the TypeSpec and ends at the end of
+				// the innermost containing block."
+				scopePos := s.Name.Pos()
+				check.declare(check.scope, s.Name, obj, scopePos)
+				check.typeDecl(obj, s.Type, nil, nil, s.Assign.IsValid())
 
 			default:
 				check.invalidAST(s.Pos(), "const, type, or var declaration expected")

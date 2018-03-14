@@ -8,7 +8,7 @@ package types
 
 import (
 	"go/ast"
-	exact "go/constant" // Renamed to reduce diffs from x/tools.  TODO: remove
+	"go/constant"
 	"go/token"
 )
 
@@ -36,25 +36,35 @@ type exprInfo struct {
 	isLhs bool // expression is lhs operand of a shift with delayed type-check
 	mode  operandMode
 	typ   *Basic
-	val   exact.Value // constant value; or nil (if not a constant)
-}
-
-// funcInfo stores the information required for type-checking a function.
-type funcInfo struct {
-	name string    // for debugging/tracing only
-	decl *declInfo // for cycle detection
-	sig  *Signature
-	body *ast.BlockStmt
+	val   constant.Value // constant value; or nil (if not a constant)
 }
 
 // A context represents the context within which an object is type-checked.
 type context struct {
-	decl          *declInfo   // package-level declaration whose init expression/function body is checked
-	scope         *Scope      // top-most scope for lookups
-	iota          exact.Value // value of iota in a constant declaration; nil otherwise
-	sig           *Signature  // function signature if inside a function; nil otherwise
-	hasLabel      bool        // set if a function makes use of labels (only ~1% of functions); unused outside functions
-	hasCallOrRecv bool        // set if an expression contains a function call or channel receive operation
+	decl          *declInfo              // package-level declaration whose init expression/function body is checked
+	scope         *Scope                 // top-most scope for lookups
+	pos           token.Pos              // if valid, identifiers are looked up as if at position pos (used by Eval)
+	iota          constant.Value         // value of iota in a constant declaration; nil otherwise
+	sig           *Signature             // function signature if inside a function; nil otherwise
+	isPanic       map[*ast.CallExpr]bool // set of panic call expressions (used for termination check)
+	hasLabel      bool                   // set if a function makes use of labels (only ~1% of functions); unused outside functions
+	hasCallOrRecv bool                   // set if an expression contains a function call or channel receive operation
+}
+
+// lookup looks up name in the current context and returns the matching object, or nil.
+func (ctxt *context) lookup(name string) Object {
+	_, obj := ctxt.scope.LookupParent(name, ctxt.pos)
+	return obj
+}
+
+// An importKey identifies an imported package by import path and source directory
+// (directory containing the file containing the import). In practice, the directory
+// may always be the same, or may not matter. Given an (import path, directory), an
+// importer must always return the same package (but given two different import paths,
+// an importer may still return the same package by mapping them to the same package
+// paths).
+type importKey struct {
+	path, dir string
 }
 
 // A Checker maintains the state of the type checker.
@@ -66,7 +76,8 @@ type Checker struct {
 	fset *token.FileSet
 	pkg  *Package
 	*Info
-	objMap map[Object]*declInfo // maps package-level object to declaration info
+	objMap map[Object]*declInfo   // maps package-level object to declaration info
+	impMap map[importKey]*Package // maps (import path, source directory) to (complete or fake) package
 
 	// information collected during type-checking of a set of package files
 	// (initialized by Files, valid only for the duration of check.Files;
@@ -74,11 +85,11 @@ type Checker struct {
 	files            []*ast.File                       // package files
 	unusedDotImports map[*Scope]map[*Package]token.Pos // positions of unused dot-imported packages for each file scope
 
-	firstErr error                 // first error encountered
-	methods  map[string][]*Func    // maps type names to associated methods
-	untyped  map[ast.Expr]exprInfo // map of expressions without final type
-	funcs    []funcInfo            // list of functions to type-check
-	delayed  []func()              // delayed checks requiring fully setup types
+	firstErr   error                    // first error encountered
+	methods    map[*TypeName][]*Func    // maps package scope type names to associated non-blank, non-interface methods
+	interfaces map[*TypeName]*ifaceInfo // maps interface type names to corresponding interface infos
+	untyped    map[ast.Expr]exprInfo    // map of expressions without final type
+	delayed    []func()                 // stack of delayed actions
 
 	// context within which the current object is type-checked
 	// (valid only for the duration of type-checking a specific object)
@@ -116,16 +127,7 @@ func (check *Checker) addDeclDep(to Object) {
 	from.addDep(to)
 }
 
-func (check *Checker) assocMethod(tname string, meth *Func) {
-	m := check.methods
-	if m == nil {
-		m = make(map[string][]*Func)
-		check.methods = m
-	}
-	m[tname] = append(m[tname], meth)
-}
-
-func (check *Checker) rememberUntyped(e ast.Expr, lhs bool, mode operandMode, typ *Basic, val exact.Value) {
+func (check *Checker) rememberUntyped(e ast.Expr, lhs bool, mode operandMode, typ *Basic, val constant.Value) {
 	m := check.untyped
 	if m == nil {
 		m = make(map[ast.Expr]exprInfo)
@@ -134,11 +136,11 @@ func (check *Checker) rememberUntyped(e ast.Expr, lhs bool, mode operandMode, ty
 	m[e] = exprInfo{lhs, mode, typ, val}
 }
 
-func (check *Checker) later(name string, decl *declInfo, sig *Signature, body *ast.BlockStmt) {
-	check.funcs = append(check.funcs, funcInfo{name, decl, sig, body})
-}
-
-func (check *Checker) delay(f func()) {
+// later pushes f on to the stack of actions that will be processed later;
+// either at the end of the current statement, or in case of a local constant
+// or variable declaration, before the constant or variable is in scope
+// (so that f still sees the scope before any new declarations).
+func (check *Checker) later(f func()) {
 	check.delayed = append(check.delayed, f)
 }
 
@@ -161,6 +163,7 @@ func NewChecker(conf *Config, fset *token.FileSet, pkg *Package, info *Info) *Ch
 		pkg:    pkg,
 		Info:   info,
 		objMap: make(map[Object]*declInfo),
+		impMap: make(map[importKey]*Package),
 	}
 }
 
@@ -173,8 +176,8 @@ func (check *Checker) initFiles(files []*ast.File) {
 
 	check.firstErr = nil
 	check.methods = nil
+	check.interfaces = nil
 	check.untyped = nil
-	check.funcs = nil
 	check.delayed = nil
 
 	// determine package name and collect valid files
@@ -214,26 +217,23 @@ func (check *Checker) handleBailout(err *error) {
 }
 
 // Files checks the provided files as part of the checker's package.
-func (check *Checker) Files(files []*ast.File) (err error) {
+func (check *Checker) Files(files []*ast.File) error { return check.checkFiles(files) }
+
+func (check *Checker) checkFiles(files []*ast.File) (err error) {
 	defer check.handleBailout(&err)
 
 	check.initFiles(files)
 
 	check.collectObjects()
 
-	check.packageObjects(check.resolveOrder())
+	check.packageObjects()
 
-	check.functionBodies()
+	check.processDelayed(0) // incl. all functions
 
 	check.initOrder()
 
 	if !check.conf.DisableUnusedImportCheck {
 		check.unusedImports()
-	}
-
-	// perform delayed checks
-	for _, f := range check.delayed {
-		f()
 	}
 
 	check.recordUntyped()
@@ -256,14 +256,14 @@ func (check *Checker) recordUntyped() {
 	}
 }
 
-func (check *Checker) recordTypeAndValue(x ast.Expr, mode operandMode, typ Type, val exact.Value) {
+func (check *Checker) recordTypeAndValue(x ast.Expr, mode operandMode, typ Type, val constant.Value) {
 	assert(x != nil)
 	assert(typ != nil)
 	if mode == invalid {
 		return // omit
 	}
 	assert(typ != nil)
-	if mode == constant {
+	if mode == constant_ {
 		assert(val != nil)
 		assert(typ == Typ[Invalid] || isConstType(typ))
 	}
@@ -342,7 +342,6 @@ func (check *Checker) recordImplicit(node ast.Node, obj Object) {
 func (check *Checker) recordSelection(x *ast.SelectorExpr, kind SelectionKind, recv Type, obj Object, index []int, indirect bool) {
 	assert(obj != nil && (recv == nil || len(index) > 0))
 	check.recordUse(x.Sel, obj)
-	// TODO(gri) Should we also call recordTypeAndValue?
 	if m := check.Selections; m != nil {
 		m[x] = &Selection{kind, recv, obj, index, indirect}
 	}

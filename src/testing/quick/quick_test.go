@@ -259,16 +259,69 @@ func TestFailure(t *testing.T) {
 	}
 }
 
-// The following test didn't terminate because nil pointers were not
-// generated.
-// Issue 8818.
-func TestNilPointers(t *testing.T) {
-	type Recursive struct {
-		Next *Recursive
+// Recursive data structures didn't terminate.
+// Issues 8818 and 11148.
+func TestRecursive(t *testing.T) {
+	type R struct {
+		Ptr      *R
+		SliceP   []*R
+		Slice    []R
+		Map      map[int]R
+		MapP     map[int]*R
+		MapR     map[*R]*R
+		SliceMap []map[int]R
 	}
 
-	f := func(rec Recursive) bool {
+	f := func(r R) bool { return true }
+	Check(f, nil)
+}
+
+func TestEmptyStruct(t *testing.T) {
+	f := func(struct{}) bool { return true }
+	Check(f, nil)
+}
+
+type (
+	A struct{ B *B }
+	B struct{ A *A }
+)
+
+func TestMutuallyRecursive(t *testing.T) {
+	f := func(a A) bool { return true }
+	Check(f, nil)
+}
+
+// Some serialization formats (e.g. encoding/pem) cannot distinguish
+// between a nil and an empty map or slice, so avoid generating the
+// zero value for these.
+func TestNonZeroSliceAndMap(t *testing.T) {
+	type Q struct {
+		M map[int]int
+		S []int
+	}
+	f := func(q Q) bool {
+		return q.M != nil && q.S != nil
+	}
+	err := Check(f, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInt64(t *testing.T) {
+	var lo, hi int64
+	f := func(x int64) bool {
+		if x < lo {
+			lo = x
+		}
+		if x > hi {
+			hi = x
+		}
 		return true
 	}
-	Check(f, nil)
+	cfg := &Config{MaxCount: 100000}
+	Check(f, cfg)
+	if uint64(lo)>>62 == 0 || uint64(hi)>>62 == 0 {
+		t.Errorf("int64 returned range %#016x,%#016x; does not look like full range", lo, hi)
+	}
 }

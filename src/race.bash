@@ -4,7 +4,7 @@
 # license that can be found in the LICENSE file.
 
 # race.bash tests the standard library under the race detector.
-# http://golang.org/doc/articles/race_detector.html
+# https://golang.org/doc/articles/race_detector.html
 
 set -e
 
@@ -41,4 +41,4 @@ if [ ! -f make.bash ]; then
 fi
 . ./make.bash --no-banner
 go install -race std
-go tool dist test -no-rebuild -race
+go tool dist test -race

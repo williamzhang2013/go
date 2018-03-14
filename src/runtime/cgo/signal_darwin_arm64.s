@@ -4,13 +4,13 @@
 
 #include "textflag.h"
 
-// panicmem is the entrypoint for SIGSEGV as intercepted via a
+// xx_cgo_panicmem is the entrypoint for SIGSEGV as intercepted via a
 // mach thread port as EXC_BAD_ACCESS. As the segfault may have happened
-// in C code, we first need to load_g then call panicmem.
+// in C code, we first need to load_g then call xx_cgo_panicmem.
 //
 //	R1 - LR at moment of fault
 //	R2 - PC at moment of fault
-TEXT ·panicmem(SB),NOSPLIT,$-8
+TEXT xx_cgo_panicmem(SB),NOSPLIT|NOFRAME,$0
 	// If in external C code, we need to load the g register.
 	BL  runtime·load_g(SB)
 	CMP $0, g
@@ -18,8 +18,9 @@ TEXT ·panicmem(SB),NOSPLIT,$-8
 
 	// On a foreign thread.
 	// TODO(crawshaw): call badsignal
+	MOVD.W $0, -16(RSP)
 	MOVW $139, R1
-	MOVW R1, (RSP)
+	MOVW R1, 8(RSP)
 	B    runtime·exit(SB)
 
 ongothread:
@@ -33,10 +34,23 @@ ongothread:
 	// To do this we call into runtime·setsigsegv, which sets the
 	// appropriate state inside the g object. We give it the faulting
 	// PC on the stack, then put it in the LR before calling sigpanic.
-	STP.W (R1, R2), -16(RSP)
-	BL runtime·setsigsegv(SB)
-	LDP.P 16(RSP), (R1, R2)
 
+	// Build a 32-byte stack frame for us for this call.
+	// Saved LR (none available) is at the bottom,
+	// then the PC argument for setsigsegv, 
+	// then a copy of the LR for us to restore.
+	MOVD.W $0, -32(RSP)
 	MOVD R1, 8(RSP)
-	MOVD R2, R30 // link register
+	MOVD R2, 16(RSP)
+	BL runtime·setsigsegv(SB)
+	MOVD 8(RSP), R1
+	MOVD 16(RSP), R2
+
+	// Build a 16-byte stack frame for the simulated
+	// call to sigpanic, by taking 16 bytes away from the
+	// 32-byte stack frame above.
+	// The saved LR in this frame is the LR at time of fault,
+	// and the LR on entry to sigpanic is the PC at time of fault.
+	MOVD.W R1, 16(RSP)
+	MOVD R2, R30
 	B runtime·sigpanic(SB)

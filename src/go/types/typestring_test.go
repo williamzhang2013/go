@@ -9,6 +9,7 @@ import (
 	"go/importer"
 	"go/parser"
 	"go/token"
+	"internal/testenv"
 	"testing"
 
 	. "go/types"
@@ -16,7 +17,7 @@ import (
 
 const filename = "<src>"
 
-func makePkg(t *testing.T, src string) (*Package, error) {
+func makePkg(src string) (*Package, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filename, src, parser.DeclarationErrors)
 	if err != nil {
@@ -117,7 +118,7 @@ var dependentTestTypes = []testEntry{
 }
 
 func TestTypeString(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	var tests []testEntry
 	tests = append(tests, independentTestTypes...)
@@ -125,7 +126,7 @@ func TestTypeString(t *testing.T) {
 
 	for _, test := range tests {
 		src := `package p; import "io"; type _ io.Writer; type T ` + test.src
-		pkg, err := makePkg(t, src)
+		pkg, err := makePkg(src)
 		if err != nil {
 			t.Errorf("%s: %s", src, err)
 			continue
@@ -133,6 +134,26 @@ func TestTypeString(t *testing.T) {
 		typ := pkg.Scope().Lookup("T").Type().Underlying()
 		if got := typ.String(); got != test.str {
 			t.Errorf("%s: got %s, want %s", test.src, got, test.str)
+		}
+	}
+}
+
+func TestIncompleteInterfaces(t *testing.T) {
+	sig := NewSignature(nil, nil, nil, false)
+	for _, test := range []struct {
+		typ  *Interface
+		want string
+	}{
+		{new(Interface), "interface{/* incomplete */}"},
+		{new(Interface).Complete(), "interface{}"},
+		{NewInterface(nil, nil), "interface{/* incomplete */}"},
+		{NewInterface(nil, nil).Complete(), "interface{}"},
+		{NewInterface([]*Func{NewFunc(token.NoPos, nil, "m", sig)}, nil), "interface{m() /* incomplete */}"},
+		{NewInterface([]*Func{NewFunc(token.NoPos, nil, "m", sig)}, nil).Complete(), "interface{m()}"},
+	} {
+		got := test.typ.String()
+		if got != test.want {
+			t.Errorf("got: %s, want: %s", got, test.want)
 		}
 	}
 }
@@ -147,13 +168,20 @@ func TestQualifiedTypeString(t *testing.T) {
 		this *Package
 		want string
 	}{
+		{nil, nil, "<nil>"},
 		{pT, nil, "p.T"},
 		{pT, p, "T"},
 		{pT, q, "p.T"},
 		{NewPointer(pT), p, "*T"},
 		{NewPointer(pT), q, "*p.T"},
 	} {
-		if got := TypeString(test.this, test.typ); got != test.want {
+		qualifier := func(pkg *Package) string {
+			if pkg != test.this {
+				return pkg.Name()
+			}
+			return ""
+		}
+		if got := TypeString(test.typ, qualifier); got != test.want {
 			t.Errorf("TypeString(%s, %s) = %s, want %s",
 				test.this, test.typ, got, test.want)
 		}

@@ -1,4 +1,4 @@
-// Copyright 2013 The Go Authors.  All rights reserved.
+// Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -15,6 +15,7 @@
 package syscall
 
 import (
+	"io"
 	"sync"
 	"unsafe"
 )
@@ -367,9 +368,9 @@ func (f *fsysFile) seek(offset int64, whence int) (int64, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
 	switch whence {
-	case 1:
+	case io.SeekCurrent:
 		offset += f.offset
-	case 2:
+	case io.SeekEnd:
 		offset += f.inode.Size
 	}
 	if offset < 0 {
@@ -624,6 +625,8 @@ func UtimesNano(path string, ts []Timespec) error {
 
 func Link(path, link string) error {
 	fsinit()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	ip, _, err := fs.namei(path, false)
 	if err != nil {
 		return err
@@ -635,12 +638,18 @@ func Link(path, link string) error {
 	if ip.Mode&S_IFMT == S_IFDIR {
 		return EPERM
 	}
+	_, _, err = fs.dirlookup(dp, elem)
+	if err == nil {
+		return EEXIST
+	}
 	fs.dirlink(dp, elem, ip)
 	return nil
 }
 
 func Rename(from, to string) error {
 	fsinit()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	fdp, felem, err := fs.namei(from, true)
 	if err != nil {
 		return err

@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"errors"
+	"fmt"
 	"hash"
 )
 
@@ -34,12 +35,8 @@ func pHash(result, secret, seed []byte, hash func() hash.Hash) {
 		h.Write(a)
 		h.Write(seed)
 		b := h.Sum(nil)
-		todo := len(b)
-		if j+todo > len(result) {
-			todo = len(result) - j
-		}
-		copy(result[j:j+todo], b)
-		j += todo
+		copy(result[j:], b)
+		j += len(b)
 
 		h.Reset()
 		h.Write(a)
@@ -85,7 +82,7 @@ func prf30(result, secret, label, seed []byte) {
 
 	done := 0
 	i := 0
-	// RFC5246 section 6.3 says that the largest PRF output needed is 128
+	// RFC 5246 section 6.3 says that the largest PRF output needed is 128
 	// bytes. Since no more ciphersuites will be added to SSLv3, this will
 	// remain true. Each iteration gives us 16 bytes so 10 iterations will
 	// be sufficient.
@@ -145,11 +142,12 @@ func prfForVersion(version uint16, suite *cipherSuite) func(result, secret, labe
 // masterFromPreMasterSecret generates the master secret from the pre-master
 // secret. See http://tools.ietf.org/html/rfc5246#section-8.1
 func masterFromPreMasterSecret(version uint16, suite *cipherSuite, preMasterSecret, clientRandom, serverRandom []byte) []byte {
-	var seed [tlsRandomLength * 2]byte
-	copy(seed[0:len(clientRandom)], clientRandom)
-	copy(seed[len(clientRandom):], serverRandom)
+	seed := make([]byte, 0, len(clientRandom)+len(serverRandom))
+	seed = append(seed, clientRandom...)
+	seed = append(seed, serverRandom...)
+
 	masterSecret := make([]byte, masterSecretLength)
-	prfForVersion(version, suite)(masterSecret, preMasterSecret, masterSecretLabel, seed[0:])
+	prfForVersion(version, suite)(masterSecret, preMasterSecret, masterSecretLabel, seed)
 	return masterSecret
 }
 
@@ -157,13 +155,13 @@ func masterFromPreMasterSecret(version uint16, suite *cipherSuite, preMasterSecr
 // secret, given the lengths of the MAC key, cipher key and IV, as defined in
 // RFC 2246, section 6.3.
 func keysFromMasterSecret(version uint16, suite *cipherSuite, masterSecret, clientRandom, serverRandom []byte, macLen, keyLen, ivLen int) (clientMAC, serverMAC, clientKey, serverKey, clientIV, serverIV []byte) {
-	var seed [tlsRandomLength * 2]byte
-	copy(seed[0:len(clientRandom)], serverRandom)
-	copy(seed[len(serverRandom):], clientRandom)
+	seed := make([]byte, 0, len(serverRandom)+len(clientRandom))
+	seed = append(seed, serverRandom...)
+	seed = append(seed, clientRandom...)
 
 	n := 2*macLen + 2*keyLen + 2*ivLen
 	keyMaterial := make([]byte, n)
-	prfForVersion(version, suite)(keyMaterial, masterSecret, keyExpansionLabel, seed[0:])
+	prfForVersion(version, suite)(keyMaterial, masterSecret, keyExpansionLabel, seed)
 	clientMAC = keyMaterial[:macLen]
 	keyMaterial = keyMaterial[macLen:]
 	serverMAC = keyMaterial[:macLen]
@@ -179,17 +177,19 @@ func keysFromMasterSecret(version uint16, suite *cipherSuite, masterSecret, clie
 }
 
 // lookupTLSHash looks up the corresponding crypto.Hash for a given
-// TLS hash identifier.
-func lookupTLSHash(hash uint8) (crypto.Hash, error) {
-	switch hash {
-	case hashSHA1:
+// hash from a TLS SignatureScheme.
+func lookupTLSHash(signatureAlgorithm SignatureScheme) (crypto.Hash, error) {
+	switch signatureAlgorithm {
+	case PKCS1WithSHA1, ECDSAWithSHA1:
 		return crypto.SHA1, nil
-	case hashSHA256:
+	case PKCS1WithSHA256, PSSWithSHA256, ECDSAWithP256AndSHA256:
 		return crypto.SHA256, nil
-	case hashSHA384:
+	case PKCS1WithSHA384, PSSWithSHA384, ECDSAWithP384AndSHA384:
 		return crypto.SHA384, nil
+	case PKCS1WithSHA512, PSSWithSHA512, ECDSAWithP521AndSHA512:
+		return crypto.SHA512, nil
 	default:
-		return 0, errors.New("tls: unsupported hash algorithm")
+		return 0, fmt.Errorf("tls: unsupported signature algorithm: %#04x", signatureAlgorithm)
 	}
 }
 
@@ -309,31 +309,26 @@ func (h finishedHash) serverSum(masterSecret []byte) []byte {
 	return out
 }
 
-// selectClientCertSignatureAlgorithm returns a signatureAndHash to sign a
+// selectClientCertSignatureAlgorithm returns a SignatureScheme to sign a
 // client's CertificateVerify with, or an error if none can be found.
-func (h finishedHash) selectClientCertSignatureAlgorithm(serverList []signatureAndHash, sigType uint8) (signatureAndHash, error) {
-	if h.version < VersionTLS12 {
-		// Nothing to negotiate before TLS 1.2.
-		return signatureAndHash{signature: sigType}, nil
-	}
-
+func (h finishedHash) selectClientCertSignatureAlgorithm(serverList []SignatureScheme, sigType uint8) (SignatureScheme, error) {
 	for _, v := range serverList {
-		if v.signature == sigType && isSupportedSignatureAndHash(v, supportedSignatureAlgorithms) {
+		if signatureFromSignatureScheme(v) == sigType && isSupportedSignatureAlgorithm(v, supportedSignatureAlgorithms) {
 			return v, nil
 		}
 	}
-	return signatureAndHash{}, errors.New("tls: no supported signature algorithm found for signing client certificate")
+	return 0, errors.New("tls: no supported signature algorithm found for signing client certificate")
 }
 
 // hashForClientCertificate returns a digest, hash function, and TLS 1.2 hash
 // id suitable for signing by a TLS client certificate.
-func (h finishedHash) hashForClientCertificate(signatureAndHash signatureAndHash, masterSecret []byte) ([]byte, crypto.Hash, error) {
+func (h finishedHash) hashForClientCertificate(sigType uint8, signatureAlgorithm SignatureScheme, masterSecret []byte) ([]byte, crypto.Hash, error) {
 	if (h.version == VersionSSL30 || h.version >= VersionTLS12) && h.buffer == nil {
 		panic("a handshake hash for a client-certificate was requested after discarding the handshake buffer")
 	}
 
 	if h.version == VersionSSL30 {
-		if signatureAndHash.signature != signatureRSA {
+		if sigType != signatureRSA {
 			return nil, 0, errors.New("tls: unsupported signature type for client certificate")
 		}
 
@@ -344,7 +339,7 @@ func (h finishedHash) hashForClientCertificate(signatureAndHash signatureAndHash
 		return finishedSum30(md5Hash, sha1Hash, masterSecret, nil), crypto.MD5SHA1, nil
 	}
 	if h.version >= VersionTLS12 {
-		hashAlg, err := lookupTLSHash(signatureAndHash.hash)
+		hashAlg, err := lookupTLSHash(signatureAlgorithm)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -353,7 +348,7 @@ func (h finishedHash) hashForClientCertificate(signatureAndHash signatureAndHash
 		return hash.Sum(nil), hashAlg, nil
 	}
 
-	if signatureAndHash.signature == signatureECDSA {
+	if sigType == signatureECDSA {
 		return h.server.Sum(nil), crypto.SHA1, nil
 	}
 

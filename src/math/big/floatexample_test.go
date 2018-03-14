@@ -11,7 +11,7 @@ import (
 )
 
 func ExampleFloat_Add() {
-	// Operating on numbers of different precision.
+	// Operate on numbers of different precision.
 	var x, y, z big.Float
 	x.SetInt64(1000)          // x is automatically set to 64bit precision
 	y.SetFloat64(2.718281828) // y is automatically set to 53bit precision
@@ -26,8 +26,8 @@ func ExampleFloat_Add() {
 	// z = 1002.718282 (0x.faadf854p+10, prec = 32, acc = Below)
 }
 
-func Example_Shift() {
-	// Implementing Float "shift" by modifying the (binary) exponents directly.
+func ExampleFloat_shift() {
+	// Implement Float "shift" by modifying the (binary) exponents directly.
 	for s := -5; s <= 5; s++ {
 		x := big.NewFloat(0.5)
 		x.SetMantExp(x, x.MantExp(nil)+s) // shift x by s
@@ -108,4 +108,34 @@ func ExampleFloat_Cmp() {
 	// +Inf     0    1
 	// +Inf   1.2    1
 	// +Inf  +Inf    0
+}
+
+func ExampleRoundingMode() {
+	operands := []float64{2.6, 2.5, 2.1, -2.1, -2.5, -2.6}
+
+	fmt.Print("   x")
+	for mode := big.ToNearestEven; mode <= big.ToPositiveInf; mode++ {
+		fmt.Printf("  %s", mode)
+	}
+	fmt.Println()
+
+	for _, f64 := range operands {
+		fmt.Printf("%4g", f64)
+		for mode := big.ToNearestEven; mode <= big.ToPositiveInf; mode++ {
+			// sample operands above require 2 bits to represent mantissa
+			// set binary precision to 2 to round them to integer values
+			f := new(big.Float).SetPrec(2).SetMode(mode).SetFloat64(f64)
+			fmt.Printf("  %*g", len(mode.String()), f)
+		}
+		fmt.Println()
+	}
+
+	// Output:
+	//    x  ToNearestEven  ToNearestAway  ToZero  AwayFromZero  ToNegativeInf  ToPositiveInf
+	//  2.6              3              3       2             3              2              3
+	//  2.5              2              3       2             3              2              3
+	//  2.1              2              2       2             3              2              3
+	// -2.1             -2             -2      -2            -3             -3             -2
+	// -2.5             -2             -3      -2            -3             -3             -2
+	// -2.6             -3             -3      -2            -3             -3             -2
 }

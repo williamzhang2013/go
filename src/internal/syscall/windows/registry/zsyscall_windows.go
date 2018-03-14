@@ -2,20 +2,49 @@
 
 package registry
 
-import "unsafe"
-import "syscall"
+import (
+	"internal/syscall/windows/sysdll"
+	"syscall"
+	"unsafe"
+)
 
 var _ unsafe.Pointer
 
+// Do the interface allocations only once for common
+// Errno values.
+const (
+	errnoERROR_IO_PENDING = 997
+)
+
 var (
-	modadvapi32 = syscall.NewLazyDLL("advapi32.dll")
-	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
+	errERROR_IO_PENDING error = syscall.Errno(errnoERROR_IO_PENDING)
+)
+
+// errnoErr returns common boxed Errno values, to prevent
+// allocations at runtime.
+func errnoErr(e syscall.Errno) error {
+	switch e {
+	case 0:
+		return nil
+	case errnoERROR_IO_PENDING:
+		return errERROR_IO_PENDING
+	}
+	// TODO: add more here, after collecting data on the common
+	// error values see on Windows. (perhaps when running
+	// all.bat?)
+	return e
+}
+
+var (
+	modadvapi32 = syscall.NewLazyDLL(sysdll.Add("advapi32.dll"))
+	modkernel32 = syscall.NewLazyDLL(sysdll.Add("kernel32.dll"))
 
 	procRegCreateKeyExW           = modadvapi32.NewProc("RegCreateKeyExW")
 	procRegDeleteKeyW             = modadvapi32.NewProc("RegDeleteKeyW")
 	procRegSetValueExW            = modadvapi32.NewProc("RegSetValueExW")
 	procRegEnumValueW             = modadvapi32.NewProc("RegEnumValueW")
 	procRegDeleteValueW           = modadvapi32.NewProc("RegDeleteValueW")
+	procRegLoadMUIStringW         = modadvapi32.NewProc("RegLoadMUIStringW")
 	procExpandEnvironmentStringsW = modkernel32.NewProc("ExpandEnvironmentStringsW")
 )
 
@@ -59,12 +88,20 @@ func regDeleteValue(key syscall.Handle, name *uint16) (regerrno error) {
 	return
 }
 
+func regLoadMUIString(key syscall.Handle, name *uint16, buf *uint16, buflen uint32, buflenCopied *uint32, flags uint32, dir *uint16) (regerrno error) {
+	r0, _, _ := syscall.Syscall9(procRegLoadMUIStringW.Addr(), 7, uintptr(key), uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(buf)), uintptr(buflen), uintptr(unsafe.Pointer(buflenCopied)), uintptr(flags), uintptr(unsafe.Pointer(dir)), 0, 0)
+	if r0 != 0 {
+		regerrno = syscall.Errno(r0)
+	}
+	return
+}
+
 func expandEnvironmentStrings(src *uint16, dst *uint16, size uint32) (n uint32, err error) {
 	r0, _, e1 := syscall.Syscall(procExpandEnvironmentStringsW.Addr(), 3, uintptr(unsafe.Pointer(src)), uintptr(unsafe.Pointer(dst)), uintptr(size))
 	n = uint32(r0)
 	if n == 0 {
 		if e1 != 0 {
-			err = error(e1)
+			err = errnoErr(e1)
 		} else {
 			err = syscall.EINVAL
 		}

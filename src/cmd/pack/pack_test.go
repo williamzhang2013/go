@@ -8,12 +8,12 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"internal/testenv"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -198,15 +198,7 @@ func TestExtract(t *testing.T) {
 
 // Test that pack-created archives can be understood by the tools.
 func TestHello(t *testing.T) {
-	switch runtime.GOOS {
-	case "android", "nacl":
-		t.Skipf("skipping on %s", runtime.GOOS)
-	case "darwin":
-		switch runtime.GOARCH {
-		case "arm", "arm64":
-			t.Skipf("skipping on %s/%s, cannot fork", runtime.GOOS, runtime.GOARCH)
-		}
-	}
+	testenv.MustHaveGoBuild(t)
 
 	dir := tmpDir(t)
 	defer os.RemoveAll(dir)
@@ -226,10 +218,11 @@ func TestHello(t *testing.T) {
 		return doRun(t, dir, args...)
 	}
 
-	run("go", "build", "cmd/pack") // writes pack binary to dir
-	run("go", "tool", "compile", "hello.go")
+	goBin := testenv.GoToolPath(t)
+	run(goBin, "build", "cmd/pack") // writes pack binary to dir
+	run(goBin, "tool", "compile", "hello.go")
 	run("./pack", "grc", "hello.a", "hello.o")
-	run("go", "tool", "link", "-o", "a.out", "hello.a")
+	run(goBin, "tool", "link", "-o", "a.out", "hello.a")
 	out := run("./a.out")
 	if out != "hello world\n" {
 		t.Fatalf("incorrect output: %q, want %q", out, "hello world\n")
@@ -238,15 +231,7 @@ func TestHello(t *testing.T) {
 
 // Test that pack works with very long lines in PKGDEF.
 func TestLargeDefs(t *testing.T) {
-	switch runtime.GOOS {
-	case "android", "nacl":
-		t.Skipf("skipping on %s", runtime.GOOS)
-	case "darwin":
-		switch runtime.GOARCH {
-		case "arm", "arm64":
-			t.Skipf("skipping on %s/%s, cannot fork", runtime.GOOS, runtime.GOARCH)
-		}
-	}
+	testenv.MustHaveGoBuild(t)
 
 	dir := tmpDir(t)
 	defer os.RemoveAll(dir)
@@ -298,15 +283,47 @@ func TestLargeDefs(t *testing.T) {
 		return doRun(t, dir, args...)
 	}
 
-	run("go", "build", "cmd/pack") // writes pack binary to dir
-	run("go", "tool", "compile", "large.go")
+	goBin := testenv.GoToolPath(t)
+	run(goBin, "build", "cmd/pack") // writes pack binary to dir
+	run(goBin, "tool", "compile", "large.go")
 	run("./pack", "grc", "large.a", "large.o")
-	run("go", "tool", "compile", "-I", ".", "main.go")
-	run("go", "tool", "link", "-L", ".", "-o", "a.out", "main.o")
+	run(goBin, "tool", "compile", "-I", ".", "main.go")
+	run(goBin, "tool", "link", "-L", ".", "-o", "a.out", "main.o")
 	out := run("./a.out")
 	if out != "ok\n" {
 		t.Fatalf("incorrect output: %q, want %q", out, "ok\n")
 	}
+}
+
+// Test that "\n!\n" inside export data doesn't result in a truncated
+// package definition when creating a .a archive from a .o Go object.
+func TestIssue21703(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	dir := tmpDir(t)
+	defer os.RemoveAll(dir)
+
+	const aSrc = `package a; const X = "\n!\n"`
+	err := ioutil.WriteFile(filepath.Join(dir, "a.go"), []byte(aSrc), 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const bSrc = `package b; import _ "a"`
+	err = ioutil.WriteFile(filepath.Join(dir, "b.go"), []byte(bSrc), 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(args ...string) string {
+		return doRun(t, dir, args...)
+	}
+
+	goBin := testenv.GoToolPath(t)
+	run(goBin, "build", "cmd/pack") // writes pack binary to dir
+	run(goBin, "tool", "compile", "a.go")
+	run("./pack", "c", "a.a", "a.o")
+	run(goBin, "tool", "compile", "-I", ".", "b.go")
 }
 
 // doRun runs a program in a directory and returns the output.
